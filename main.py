@@ -27,13 +27,14 @@ attention = AttentionController(settle_time_sec=0.4)
 
 latest_lidar_alert = None
 latest_vision_objects = None
+latest_ground_hazard = None
 latest_ultrasonic_cm = -1.0
 running = True
 mqtt_client = None
 
 
 def on_mqtt_message(client, userdata, msg):
-    global latest_lidar_alert, latest_vision_objects, latest_ultrasonic_cm
+    global latest_lidar_alert, latest_vision_objects, latest_ground_hazard, latest_ultrasonic_cm
     topic = msg.topic
     try:
         data = json.loads(msg.payload.decode("utf-8"))
@@ -44,6 +45,8 @@ def on_mqtt_message(client, userdata, msg):
         latest_lidar_alert = data
     elif topic == "mar/vision/detections":
         latest_vision_objects = data
+    elif topic == "mar/vision/ground_hazard":
+        latest_ground_hazard = data
     elif topic == "mar/hardware/telemetry":
         # Extract ultrasonic if present
         if "ultrasonic" in data:
@@ -83,6 +86,7 @@ def main():
             mqtt_client.subscribe([
                 ("mar/lidar/alert", 0),
                 ("mar/vision/detections", 0),
+                ("mar/vision/ground_hazard", 0),
                 ("mar/hardware/telemetry", 0),
                 ("mar/safety/estop", 2)
             ])
@@ -100,7 +104,8 @@ def main():
         cmd, reason = fsm.update(
             lidar_alert=latest_lidar_alert,
             vision_objects=latest_vision_objects,
-            ultrasonic_distance_cm=latest_ultrasonic_cm
+            ultrasonic_distance_cm=latest_ultrasonic_cm,
+            ground_hazard_alert=latest_ground_hazard
         )
 
         # Se il comando cambia o a intervalli periodici, invia a mar-serial-bridge

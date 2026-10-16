@@ -1,34 +1,36 @@
-# 🧠 Microservizio: `mar-decision-engine`
+# Microservizio: `mar-decision-engine`
 
 **Core Brain, Finite State Machine (FSM) & Active Perception**  
 *Parte dell'architettura a microservizi M.A.R. (Multi-legged Autonomous Robot)*
 
 ---
 
-## 🎯 Ruolo nell'Architettura a Microservizi
+## Ruolo nell'Architettura a Microservizi
 
 `mar-decision-engine` è il cervello decisionale autonomo del robot. Non accede direttamente all'hardware o alla fotocamera, ma agisce da **nodo di orchestrazione e fusione sensoriale di alto livello**:
 1. **Fusione Sensoriale Asincrona**:
    - Ascolta i trigger perimetrali da `mar-lidar-service` (`mar/lidar/alert`).
-   - Ascolta le classi semantiche e le distanze metriche 3D da `mar-vision-service` (`mar/vision/detections`).
+   - Ascolta le classi semantiche, la griglia spaziale 3D e gli alert dislivelli da `mar-vision-service` (`mar/vision/detections`, `mar/vision/ground_hazard`).
    - Monitora la telemetria degli ultrasuoni e della batteria da `mar-serial-bridge` (`mar/hardware/telemetry`).
 2. **Macchina a Stati Finita (Safety FSM)**:
    - `IDLE`: quadrupede in attesa con assetto eretto.
-   - `PATROL_FORWARD`: marcia autonoma in avanti con scansione di sicurezza attiva.
+   - `PATROL_FORWARD`: marcia autonoma in avanti con scansione di sicurezza attiva (`AVANTI` / `CMD:FORWARD`).
    - `INSPECTING_OBJECT`: allerta ricevuta dal LiDAR; scatto della saccade per inquadrare l'oggetto e attendere la classificazione YOLO.
-   - `AVOIDANCE`: calcolo del percorso alternativo e manovra di svolta/schivamento.
-   - `EMERGENCY_STOP`: arresto prioritario istantaneo per oggetti troppo vicini ($< 35\text{ cm}$) o comando operatore.
+   - `TERRAIN_HAZARD`: rilevamento di ostacoli bassi, scalini o buche a terra dalla griglia 3D (`STOP_TERRA`).
+   - `AVOIDANCE`: calcolo del percorso alternativo e manovra di svolta/schivamento verso il lato con maggiore clearance (`GIRA_DX` / `GIRA_SX`).
+   - `EMERGENCY_STOP`: arresto prioritario istantaneo per oggetti troppo vicini ($< 30\text{ cm}$) o comando operatore (`STOP`).
 3. **Emissione Comandi di Movimento**:
    - Pubblica le direttive cinematiche su `mar/control/motion` destinate al microcontrollore.
 
 ---
 
-## 📡 Interfacce e Topic MQTT
+## Interfacce e Topic MQTT
 
 | Topic | Tipo | Formato Payload | Descrizione |
 | :--- | :--- | :--- | :--- |
-| `mar/lidar/alert` | In ingresso (Sub) | `{"theta": 35.0, "sector": "FRONT_RIGHT", "dist_m": 0.85}` | Trigger LiDAR per attivare la saccade |
-| `mar/vision/detections` | In ingresso (Sub) | `{"count": 1, "objects": [{"class": "box", "distance_cm": 82}]}` | Ostacoli 3D riconosciuti da YOLO |
+| `mar/lidar/alert` | In ingresso (Sub) | `{"theta": 35.0, "sector": "Front-DX", "dist_m": 0.85}` | Trigger LiDAR per attivare la saccade |
+| `mar/vision/detections` | In ingresso (Sub) | `{"count": 1, "objects": [...], "spatial_grid_3d": {...}}` | Ostacoli 3D e griglia spaziale a 9 zone |
+| `mar/vision/ground_hazard` | In ingresso (Sub) | `{"z_basso_cm": 35.0, "hazard": "TERRAIN_OR_LOW_OBSTACLE"}` | Notifica dislivello o scalino a terra |
 | `mar/hardware/telemetry` | In ingresso (Sub) | `{"ultrasonic": "28.5", "batt": "11.8"}` | Telemetria fisica da Arduino |
 | `mar/safety/estop` | In ingresso (Sub) | `{"reason": "OPERATOR"}` | Segnale di stop prioritario |
 | `mar/control/motion` | In uscita (Pub) | `{"cmd": "FORWARD", "param": "50", "reason": "PATROL"}` | Comando per `mar-serial-bridge` |
@@ -36,13 +38,13 @@
 
 ---
 
-## 📂 Struttura della Cartella
+## Struttura del Repository
 
 ```text
 mar-decision-engine/
 ├── README.md                  # Questo documento
 ├── requirements.txt           # paho-mqtt, numpy
-├── fsm.py                     # Macchina a stati finita con regole deterministiche
+├── fsm.py                     # Macchina a stati finita con regole deterministiche e multi-level safety
 ├── attention_controller.py    # Logica per puntamento attivo (Saccade) e motion-blur gating
 ├── obstacle_avoidance.py      # Algoritmi di punteggio rischio e clearance ostacoli
 └── main.py                    # Demone del microservizio
@@ -50,7 +52,7 @@ mar-decision-engine/
 
 ---
 
-## 🚀 Avvio del Microservizio
+## Avvio del Microservizio
 
 ### 1. Installazione Dipendenze
 ```bash
