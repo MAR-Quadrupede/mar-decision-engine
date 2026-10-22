@@ -1,0 +1,31 @@
+name: Build and Deploy mar-decision-engine (RPi ARM64)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on Self-Hosted Raspberry Pi
+    runs-on: [self-hosted, linux, arm64]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker Image on RPi
+        run: |
+          echo "Building mar-decision-engine on Raspberry Pi ARM64..."
+          docker build -t mar-decision-engine:latest .
+
+      - name: Trigger Kubernetes Rollout Restart
+        run: |
+          if command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1; then
+            echo "Applying update to Kubernetes deployment..."
+            kubectl rollout restart deployment/mar-decision-engine -n mar-system || true
+            kubectl rollout status deployment/mar-decision-engine -n mar-system --timeout=60s || true
+          else
+            echo "Kubernetes (K3s) not available yet. Image cached in local Docker daemon."
+          fi
