@@ -22,7 +22,7 @@ except ImportError:
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 
-fsm = DecisionFSM(forward_speed=50, critical_distance_m=0.35)
+fsm = DecisionFSM(forward_speed=50, critical_distance_cm=35.0)
 attention = AttentionController(settle_time_sec=0.4)
 
 latest_lidar_alert = None
