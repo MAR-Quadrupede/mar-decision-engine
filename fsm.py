@@ -44,12 +44,25 @@ class DecisionFSM:
         self.target_theta: float = 0.0
         self.avoidance_direction: str = "RIGHT"
         self.avoidance_start_time: float = 0.0
+        # Operator / dashboard E-STOP stays latched until explicit resume
+        self.operator_estop: bool = False
 
     def set_state(self, new_state: RobotState, reason: str = ""):
         if self.state != new_state:
             print(f"🔄 [FSM STATE CHANGE]: {self.state.name} ➔ {new_state.name} | Motivo: {reason}")
             self.state = new_state
             self.state_enter_time = time.time()
+
+    def trigger_operator_estop(self, reason: str = "E-Stop operatore"):
+        """Latch emergency stop from dashboard / safety topic (does not auto-clear)."""
+        self.operator_estop = True
+        self.set_state(RobotState.EMERGENCY_STOP, reason)
+
+    def clear_operator_estop(self, reason: str = "Resume operatore"):
+        """Release latched operator E-STOP and return to patrol when path allows."""
+        self.operator_estop = False
+        if self.state == RobotState.EMERGENCY_STOP:
+            self.set_state(RobotState.PATROL_FORWARD, reason)
 
     def update(
         self,
@@ -65,6 +78,12 @@ class DecisionFSM:
         Returns: (CMD_STRING, REASON_DESCRIPTION)
         """
         now = time.time()
+
+        # Latched operator E-STOP: motors stay frozen until clear_operator_estop()
+        if self.operator_estop:
+            if self.state != RobotState.EMERGENCY_STOP:
+                self.set_state(RobotState.EMERGENCY_STOP, "E-Stop operatore latched")
+            return "CMD:STOP", "[E-STOP OPERATORE] In attesa di resume"
 
         # 0. Analisi Assetto e Sicurezza IMU (Rollio e Beccheggio)
         roll_robot = 0.0
@@ -176,8 +195,9 @@ class DecisionFSM:
                 self.set_state(RobotState.TERRAIN_HAZARD, f"Dislivello o scalino a terra (Z_basso={z_basso_cm:.0f} cm)")
             return "CMD:STOP_TERRA", f"[OSTACOLO A TERRA] Z_basso: {z_basso_cm:.0f}cm"
 
-        # Se eravamo in emergency o terrain hazard e la via è ora libera, torna a marcia
-        if self.state in (RobotState.EMERGENCY_STOP, RobotState.TERRAIN_HAZARD):
+        # Sensor-triggered emergency/terrain may auto-clear when path is free.
+        # Operator-latched E-STOP never clears here.
+        if self.state in (RobotState.EMERGENCY_STOP, RobotState.TERRAIN_HAZARD) and not self.operator_estop:
             if dist_critica_fronte >= self.slow_warning_cm and not has_ground_hazard:
                 self.set_state(RobotState.PATROL_FORWARD, "Via libera confermata dai sensori 3D/LiDAR")
 

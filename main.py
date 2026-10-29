@@ -87,7 +87,10 @@ def on_mqtt_message(client, userdata, msg):
                 pass
     elif topic == "mar/safety/estop":
         print(f"🚨 [FSM E-STOP TRIGGERED]: {data}")
-        fsm.set_state(RobotState.EMERGENCY_STOP, "E-Stop da operatore o sensore critico")
+        fsm.trigger_operator_estop("E-Stop da operatore o sensore critico")
+    elif topic == "mar/safety/resume":
+        print(f"✅ [FSM RESUME]: {data}")
+        fsm.clear_operator_estop("Resume da operatore")
 
 
 def signal_handler(sig, frame):
@@ -125,7 +128,8 @@ def main():
                     ("mar/imu/raw", 0),
                     ("mar/imu/telemetry", 0),
                     ("mar/hardware/telemetry", 0),
-                    ("mar/safety/estop", 2)
+                    ("mar/safety/estop", 2),
+                    ("mar/safety/resume", 1),
                 ])
                 mqtt_client.loop_start()
                 print(f"  ✓ Connesso a MQTT Broker ({MQTT_BROKER}:{MQTT_PORT})")
