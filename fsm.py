@@ -198,12 +198,27 @@ class DecisionFSM:
 
             return turn_cmd, f"[DEVIAZIONE {direction}] DX:{d_dx:.0f}cm | SX:{d_sx:.0f}cm"
 
-        # Livello 4: Puntamento saccadico LiDAR (se anomalia periferica)
-        if lidar_alert and lidar_alert.get("has_alert", False) and abs(lidar_alert.get("theta", 0)) > 20:
+        # Livello 4: saccade solo su settori frontali (come canelidarstereoimudef2:
+        # un muro laterale puro non deve congelare la marcia in INSPECTING).
+        sector = str(lidar_alert.get("sector", "") if lidar_alert else "")
+        sector_en = str(lidar_alert.get("sector_en", "") if lidar_alert else "")
+        frontal_sector = sector in ("Fronte", "Front-DX", "Front-SX") or sector_en in (
+            "FRONT", "FRONT_RIGHT", "FRONT_LEFT"
+        )
+        if (
+            lidar_alert
+            and lidar_alert.get("has_alert", False)
+            and frontal_sector
+            and abs(float(lidar_alert.get("theta", 0) or 0)) > 20
+        ):
             if self.state == RobotState.PATROL_FORWARD:
-                self.target_theta = lidar_alert.get("theta", 0.0)
+                self.target_theta = float(lidar_alert.get("theta", 0.0) or 0.0)
                 self.set_state(RobotState.INSPECTING_OBJECT, f"LiDAR rileva ostacolo a θ={self.target_theta:.0f}°")
-                turn_cmd = f"CMD:TURN_R,{abs(int(self.target_theta))}" if self.target_theta > 0 else f"CMD:TURN_L,{abs(int(self.target_theta))}"
+                turn_cmd = (
+                    f"CMD:TURN_R,{abs(int(self.target_theta))}"
+                    if self.target_theta > 0
+                    else f"CMD:TURN_L,{abs(int(self.target_theta))}"
+                )
                 return turn_cmd, f"Puntamento saccadico verso θ={self.target_theta:.0f}°"
 
         if self.state == RobotState.INSPECTING_OBJECT:

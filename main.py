@@ -110,25 +110,32 @@ def main():
     fsm.set_state(RobotState.PATROL_FORWARD, "Avvio del sistema autonomo")
 
     if mqtt:
-        try:
-            mqtt_client = mqtt.Client(client_id="mar-decision-engine")
-            mqtt_client.on_message = on_mqtt_message
-            mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-            mqtt_client.subscribe([
-                ("mar/lidar/alert", 0),
-                ("mar/lidar/telemetry", 0),
-                ("mar/lidar/scan", 0),
-                ("mar/vision/detections", 0),
-                ("mar/vision/ground_hazard", 0),
-                ("mar/imu/raw", 0),
-                ("mar/imu/telemetry", 0),
-                ("mar/hardware/telemetry", 0),
-                ("mar/safety/estop", 2)
-            ])
-            mqtt_client.loop_start()
-            print(f"  ✓ Connesso a MQTT Broker ({MQTT_BROKER}:{MQTT_PORT})")
-        except Exception as e:
-            print(f"  ⚠️ MQTT non raggiungibile ({e}). Esecuzione standalone.")
+        mqtt_client = mqtt.Client(client_id="mar-decision-engine")
+        mqtt_client.on_message = on_mqtt_message
+        connected = False
+        for attempt in range(1, 16):
+            try:
+                mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+                mqtt_client.subscribe([
+                    ("mar/lidar/alert", 0),
+                    ("mar/lidar/telemetry", 0),
+                    ("mar/lidar/scan", 0),
+                    ("mar/vision/detections", 0),
+                    ("mar/vision/ground_hazard", 0),
+                    ("mar/imu/raw", 0),
+                    ("mar/imu/telemetry", 0),
+                    ("mar/hardware/telemetry", 0),
+                    ("mar/safety/estop", 2)
+                ])
+                mqtt_client.loop_start()
+                print(f"  ✓ Connesso a MQTT Broker ({MQTT_BROKER}:{MQTT_PORT})")
+                connected = True
+                break
+            except Exception as e:
+                print(f"  ⚠️ MQTT tentativo {attempt}/15 fallito ({e}). Retry in 2s...")
+                time.sleep(2)
+        if not connected:
+            print("  ⚠️ MQTT non raggiungibile. Esecuzione standalone.")
 
     print("\n[DECISION-ENGINE] Ciclo decisionale attivo a 20 Hz...\n")
 
