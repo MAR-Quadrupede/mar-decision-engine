@@ -30,13 +30,17 @@ class DecisionFSM:
     def __init__(
         self,
         forward_speed: int = 50,
-        critical_distance_cm: float = 30.0,
+        critical_distance_cm: float = 40.0,   # CRITICAL → STOP
+        high_distance_cm: float = 70.0,       # HIGH → FRENA
+        moderate_distance_cm: float = 120.0,  # MODERATE → avanti lento
         ground_hazard_cm: float = 40.0,
-        slow_warning_cm: float = 65.0
+        slow_warning_cm: float = 70.0,
     ):
         self.state = RobotState.IDLE
         self.forward_speed = forward_speed
         self.critical_distance_cm = critical_distance_cm
+        self.high_distance_cm = high_distance_cm
+        self.moderate_distance_cm = moderate_distance_cm
         self.ground_hazard_cm = ground_hazard_cm
         self.slow_warning_cm = slow_warning_cm
 
@@ -169,7 +173,21 @@ class DecisionFSM:
                 if "z_basso_cm" in ground_hazard_alert:
                     z_basso_cm = min(z_basso_cm, float(ground_hazard_alert["z_basso_cm"]))
 
-        # 3. Calcolo Distanza Critica Frontale Unificata (Sensor Fusion)
+        # 3. Fusione frontale: LiDAR + stereo (target/z) + ultrasuoni
+        vision_target_cm = 999.0
+        if vision_objects:
+            t_vision2 = vision_objects.get("timestamp", now)
+            if now - t_vision2 < 1.0:
+                for key in ("target_dist_cm", "obstacle_near_cm"):
+                    if vision_objects.get(key) is not None:
+                        try:
+                            vision_target_cm = min(vision_target_cm, float(vision_objects[key]))
+                        except Exception:
+                            pass
+                # risk_level CRITICAL from vision (FOV blocked / sheet) forces stop distance
+                if str(vision_objects.get("risk_level", "")).upper() == "CRITICAL":
+                    vision_target_cm = min(vision_target_cm, self.critical_distance_cm * 0.8)
+
         candidati_fronte = []
         if lidar_front_cm < 900.0:
             candidati_fronte.append(lidar_front_cm)
@@ -177,46 +195,47 @@ class DecisionFSM:
             candidati_fronte.append(z_basso_cm)
         if z_centro_cm < 900.0:
             candidati_fronte.append(z_centro_cm)
+        if vision_target_cm < 900.0:
+            candidati_fronte.append(vision_target_cm)
         if ultrasonic_distance_cm > 0:
             candidati_fronte.append(ultrasonic_distance_cm)
 
         dist_critica_fronte = min(candidati_fronte) if candidati_fronte else 999.0
 
-        # 4. Gerarchia Decisionale Multi-Livello di Sicurezza
-        # Livello 1: Arresto Critico Immediato (< 30 cm)
+        # 4. Bande unificate CRITICAL / HIGH / MODERATE / LOW
+        # CRITICAL → STOP immediato
         if dist_critica_fronte < self.critical_distance_cm:
             if self.state != RobotState.EMERGENCY_STOP:
-                self.set_state(RobotState.EMERGENCY_STOP, f"Ostacolo critico frontale ({dist_critica_fronte:.0f} cm < {self.critical_distance_cm} cm)")
-            return "CMD:STOP", f"[STOP EMERGENCY] Ostacolo a {dist_critica_fronte:.0f}cm"
+                self.set_state(
+                    RobotState.EMERGENCY_STOP,
+                    f"CRITICAL frontale {dist_critica_fronte:.0f}cm < {self.critical_distance_cm:.0f}cm",
+                )
+            return "CMD:STOP", f"[CRITICAL] Ostacolo a {dist_critica_fronte:.0f}cm"
 
-        # Livello 2: Ostacolo a Terra / Dislivello non visibile dal LiDAR
+        # Terrain hazard
         if has_ground_hazard and (z_basso_cm < self.ground_hazard_cm):
             if self.state != RobotState.TERRAIN_HAZARD:
-                self.set_state(RobotState.TERRAIN_HAZARD, f"Dislivello o scalino a terra (Z_basso={z_basso_cm:.0f} cm)")
+                self.set_state(RobotState.TERRAIN_HAZARD, f"Dislivello a terra (Z_basso={z_basso_cm:.0f} cm)")
             return "CMD:STOP_TERRA", f"[OSTACOLO A TERRA] Z_basso: {z_basso_cm:.0f}cm"
 
-        # Sensor-triggered emergency/terrain may auto-clear when path is free.
-        # Operator-latched E-STOP never clears here.
         if self.state in (RobotState.EMERGENCY_STOP, RobotState.TERRAIN_HAZARD) and not self.operator_estop:
-            if dist_critica_fronte >= self.slow_warning_cm and not has_ground_hazard:
+            if dist_critica_fronte >= self.moderate_distance_cm and not has_ground_hazard:
                 self.set_state(RobotState.PATROL_FORWARD, "Via libera confermata dai sensori 3D/LiDAR")
 
-        # Livello 3: Rallentamento e Schivamento Dinamico (< 65 cm)
-        if dist_critica_fronte < self.slow_warning_cm:
-            # Scegli la direzione con maggiore spazio libero (Destra vs Sinistra da LiDAR 8 settori)
-            if d_dx >= d_sx:
-                direction = "RIGHT"
-                turn_cmd = "CMD:TURN_R,45"
-            else:
-                direction = "LEFT"
-                turn_cmd = "CMD:TURN_L,45"
-
-            self.avoidance_direction = direction
-            self.avoidance_start_time = now
+        # HIGH → frena (niente svolta se ostacolo frontale vicino)
+        if dist_critica_fronte < self.high_distance_cm:
             if self.state != RobotState.AVOIDANCE:
-                self.set_state(RobotState.AVOIDANCE, f"Ostacolo a {dist_critica_fronte:.0f}cm. Svolta verso {direction} (DX={d_dx:.0f}cm, SX={d_sx:.0f}cm)")
+                self.set_state(RobotState.AVOIDANCE, f"HIGH: ostacolo a {dist_critica_fronte:.0f}cm")
+            return "CMD:STOP", f"[HIGH/FRENA] Ostacolo a {dist_critica_fronte:.0f}cm"
 
-            return turn_cmd, f"[DEVIAZIONE {direction}] DX:{d_dx:.0f}cm | SX:{d_sx:.0f}cm"
+        # MODERATE → avanti lento; se laterale chiaro può scostarsi
+        if dist_critica_fronte < self.moderate_distance_cm:
+            slow = max(15, self.forward_speed // 2)
+            if min(d_dx, d_sx) < 40.0 and abs(d_dx - d_sx) > 25.0:
+                if d_dx >= d_sx:
+                    return "CMD:TURN_R,25", f"[MODERATE] Scosto DX (fronte {dist_critica_fronte:.0f}cm)"
+                return "CMD:TURN_L,25", f"[MODERATE] Scosto SX (fronte {dist_critica_fronte:.0f}cm)"
+            return f"CMD:FORWARD,{slow}", f"[MODERATE] Avanti lento {slow}% (fronte {dist_critica_fronte:.0f}cm)"
 
         # Livello 4: saccade solo su settori frontali (come canelidarstereoimudef2:
         # un muro laterale puro non deve congelare la marcia in INSPECTING).

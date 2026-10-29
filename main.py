@@ -25,7 +25,13 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 IMU_CALIBRATION_SAMPLES = int(os.getenv("IMU_CALIBRATION_SAMPLES", "100"))
 IMU_CALIBRATION_TIMEOUT_S = float(os.getenv("IMU_CALIBRATION_TIMEOUT_S", "12"))
 
-fsm = DecisionFSM(forward_speed=50, critical_distance_cm=35.0)
+fsm = DecisionFSM(
+    forward_speed=50,
+    critical_distance_cm=40.0,
+    high_distance_cm=70.0,
+    moderate_distance_cm=120.0,
+    slow_warning_cm=70.0,
+)
 attention = AttentionController(settle_time_sec=0.4)
 imu_fusion = IMUFusion(
     calibration_samples=IMU_CALIBRATION_SAMPLES,
@@ -61,6 +67,17 @@ def on_mqtt_message(client, userdata, msg):
                 latest_lidar_alert["front_distance_m"] = data["front_distance_m"]
     elif topic == "mar/vision/detections":
         latest_vision_objects = data
+    elif topic == "mar/vision/command":
+        # Merge command risk/distance into detections for FSM fusion
+        if latest_vision_objects is None:
+            latest_vision_objects = {}
+        latest_vision_objects = {
+            **latest_vision_objects,
+            "target_dist_cm": data.get("target_dist_cm", latest_vision_objects.get("target_dist_cm")),
+            "obstacle_near_cm": data.get("obstacle_near_cm", latest_vision_objects.get("obstacle_near_cm")),
+            "risk_level": data.get("risk_level", latest_vision_objects.get("risk_level")),
+            "timestamp": data.get("timestamp", time.time()),
+        }
     elif topic == "mar/vision/ground_hazard":
         latest_ground_hazard = data
     elif topic == "mar/imu/raw":
@@ -124,6 +141,7 @@ def main():
                     ("mar/lidar/telemetry", 0),
                     ("mar/lidar/scan", 0),
                     ("mar/vision/detections", 0),
+                    ("mar/vision/command", 0),
                     ("mar/vision/ground_hazard", 0),
                     ("mar/imu/raw", 0),
                     ("mar/imu/telemetry", 0),
