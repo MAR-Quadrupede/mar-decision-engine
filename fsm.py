@@ -56,13 +56,29 @@ class DecisionFSM:
         lidar_alert: Optional[Dict],
         vision_objects: Optional[Dict],
         ultrasonic_distance_cm: float = -1.0,
-        ground_hazard_alert: Optional[Dict] = None
+        ground_hazard_alert: Optional[Dict] = None,
+        imu_data: Optional[Dict] = None
     ) -> Tuple[str, str]:
         """
-        Processes multi-sensor inputs and produces the next motion command.
+        Processes multi-sensor inputs (LiDAR 360°, Stereo 3D Vision, IMU Kalman, Ultrasonic)
+        and produces the next deterministic motion command.
         Returns: (CMD_STRING, REASON_DESCRIPTION)
         """
         now = time.time()
+
+        # 0. Analisi Assetto e Sicurezza IMU (Rollio e Beccheggio)
+        roll_robot = 0.0
+        pitch_robot = 0.0
+        if imu_data:
+            t_imu = imu_data.get("timestamp", now)
+            if now - t_imu < 1.0:
+                roll_robot = float(imu_data.get("roll", 0.0))
+                pitch_robot = float(imu_data.get("pitch", 0.0))
+
+        if abs(roll_robot) > 40.0 or abs(pitch_robot) > 40.0:
+            if self.state != RobotState.EMERGENCY_STOP:
+                self.set_state(RobotState.EMERGENCY_STOP, f"Inclinazione critica (Roll:{roll_robot:.1f}°, Pitch:{pitch_robot:.1f}°)")
+            return "CMD:STOP", f"[STOP INCLINAZIONE CRITICA] Roll:{roll_robot:.1f}° Pitch:{pitch_robot:.1f}°"
 
         # 1. Estrazione metriche LiDAR (Fronte, DX, SX)
         lidar_front_cm = 999.0
@@ -70,19 +86,41 @@ class DecisionFSM:
         d_sx = 999.0
 
         if lidar_alert:
-            sec_mins = lidar_alert.get("sector_mins", {})
-            # Read frontal sector in cm
-            f_m = lidar_alert.get("dist_m")
-            if f_m is not None:
-                lidar_front_cm = f_m * 100.0
+            t_lidar = lidar_alert.get("timestamp", now)
+            if now - t_lidar < 1.0:
+                sec_mins = lidar_alert.get("sector_mins", {})
+                if not sec_mins and "sector_mins_en" in lidar_alert:
+                    sec_mins = lidar_alert.get("sector_mins_en", {})
 
-            # Read Lateral clearances
-            val_dx = sec_mins.get("Destra") or sec_mins.get("Front-DX") or sec_mins.get("RIGHT")
-            val_sx = sec_mins.get("Sinistra") or sec_mins.get("Front-SX") or sec_mins.get("LEFT")
-            if val_dx is not None:
-                d_dx = float(val_dx) * 100.0
-            if val_sx is not None:
-                d_sx = float(val_sx) * 100.0
+                # Distanza frontale da LiDAR
+                f_m = lidar_alert.get("front_distance_m")
+                if f_m is not None:
+                    lidar_front_cm = float(f_m) * 100.0 if float(f_m) < 15.0 else float(f_m)
+                elif lidar_alert.get("sector") in ("Fronte", "FRONT") and lidar_alert.get("dist_m") is not None:
+                    dist_val = float(lidar_alert["dist_m"])
+                    lidar_front_cm = dist_val * 100.0 if dist_val < 15.0 else dist_val
+                elif sec_mins.get("Fronte") is not None or sec_mins.get("FRONT") is not None:
+                    val_f = sec_mins.get("Fronte") if sec_mins.get("Fronte") is not None else sec_mins.get("FRONT")
+                    lidar_front_cm = float(val_f) * 100.0 if float(val_f) < 15.0 else float(val_f)
+
+                # Spazi laterali per deviazione (Destra vs Sinistra)
+                val_dx = (
+                    sec_mins.get("Destra") if sec_mins.get("Destra") is not None else
+                    sec_mins.get("Front-DX") if sec_mins.get("Front-DX") is not None else
+                    sec_mins.get("RIGHT") if sec_mins.get("RIGHT") is not None else
+                    sec_mins.get("FRONT_RIGHT")
+                )
+                val_sx = (
+                    sec_mins.get("Sinistra") if sec_mins.get("Sinistra") is not None else
+                    sec_mins.get("Front-SX") if sec_mins.get("Front-SX") is not None else
+                    sec_mins.get("LEFT") if sec_mins.get("LEFT") is not None else
+                    sec_mins.get("FRONT_LEFT")
+                )
+
+                if val_dx is not None:
+                    d_dx = float(val_dx) * 100.0 if float(val_dx) < 15.0 else float(val_dx)
+                if val_sx is not None:
+                    d_sx = float(val_sx) * 100.0 if float(val_sx) < 15.0 else float(val_sx)
 
         # 2. Estrazione metriche Visione 3D (Z_basso, Z_centro, Z_alto)
         z_basso_cm = 999.0
@@ -90,33 +128,42 @@ class DecisionFSM:
         has_ground_hazard = False
 
         if vision_objects:
-            grid_3d = vision_objects.get("spatial_grid_3d", {})
-            if "Basso_Centro" in grid_3d:
-                z_basso_cm = float(grid_3d["Basso_Centro"][2])
-            elif "z_basso_cm" in vision_objects:
-                z_basso_cm = float(vision_objects["z_basso_cm"])
+            t_vision = vision_objects.get("timestamp", now)
+            if now - t_vision < 1.0:
+                grid_3d = vision_objects.get("spatial_grid_3d", {})
+                if "Basso_Centro" in grid_3d:
+                    z_basso_cm = float(grid_3d["Basso_Centro"][2])
+                elif "z_basso_cm" in vision_objects:
+                    z_basso_cm = float(vision_objects["z_basso_cm"])
 
-            if "Centro_Centro" in grid_3d:
-                z_centro_cm = float(grid_3d["Centro_Centro"][2])
-            elif "z_centro_cm" in vision_objects:
-                z_centro_cm = float(vision_objects["z_centro_cm"])
+                if "Centro_Centro" in grid_3d:
+                    z_centro_cm = float(grid_3d["Centro_Centro"][2])
+                elif "z_centro_cm" in vision_objects:
+                    z_centro_cm = float(vision_objects["z_centro_cm"])
 
-            has_ground_hazard = bool(vision_objects.get("ground_hazard", False)) or (z_basso_cm < self.ground_hazard_cm)
+                has_ground_hazard = bool(vision_objects.get("ground_hazard", False)) or (z_basso_cm < self.ground_hazard_cm)
 
         if ground_hazard_alert:
-            has_ground_hazard = True
-            if "z_basso_cm" in ground_hazard_alert:
-                z_basso_cm = min(z_basso_cm, float(ground_hazard_alert["z_basso_cm"]))
+            t_hazard = ground_hazard_alert.get("timestamp", now)
+            if now - t_hazard < 1.0:
+                has_ground_hazard = True
+                if "z_basso_cm" in ground_hazard_alert:
+                    z_basso_cm = min(z_basso_cm, float(ground_hazard_alert["z_basso_cm"]))
 
-        # 3. Calcolo Distanza Critica Frontale Unificata
-        # min tra LiDAR fronte, Z basso, Z centro, e sensore ultrasuoni se valido
-        candidati_fronte = [lidar_front_cm, z_basso_cm, z_centro_cm]
+        # 3. Calcolo Distanza Critica Frontale Unificata (Sensor Fusion)
+        candidati_fronte = []
+        if lidar_front_cm < 900.0:
+            candidati_fronte.append(lidar_front_cm)
+        if z_basso_cm < 900.0:
+            candidati_fronte.append(z_basso_cm)
+        if z_centro_cm < 900.0:
+            candidati_fronte.append(z_centro_cm)
         if ultrasonic_distance_cm > 0:
             candidati_fronte.append(ultrasonic_distance_cm)
 
-        dist_critica_fronte = min(candidati_fronte)
+        dist_critica_fronte = min(candidati_fronte) if candidati_fronte else 999.0
 
-        # 4. Multi-Level Safety & Transition Hierarchy
+        # 4. Gerarchia Decisionale Multi-Livello di Sicurezza
         # Livello 1: Arresto Critico Immediato (< 30 cm)
         if dist_critica_fronte < self.critical_distance_cm:
             if self.state != RobotState.EMERGENCY_STOP:
@@ -136,7 +183,7 @@ class DecisionFSM:
 
         # Livello 3: Rallentamento e Schivamento Dinamico (< 65 cm)
         if dist_critica_fronte < self.slow_warning_cm:
-            # Scegli la direzione con maggiore spazio libero (Destra vs Sinistra)
+            # Scegli la direzione con maggiore spazio libero (Destra vs Sinistra da LiDAR 8 settori)
             if d_dx >= d_sx:
                 direction = "RIGHT"
                 turn_cmd = "CMD:TURN_R,45"
@@ -151,7 +198,7 @@ class DecisionFSM:
 
             return turn_cmd, f"[DEVIAZIONE {direction}] DX:{d_dx:.0f}cm | SX:{d_sx:.0f}cm"
 
-        # Livello 4: Puntamento saccadico LiDAR (se allarme angolare laterale)
+        # Livello 4: Puntamento saccadico LiDAR (se anomalia periferica)
         if lidar_alert and lidar_alert.get("has_alert", False) and abs(lidar_alert.get("theta", 0)) > 20:
             if self.state == RobotState.PATROL_FORWARD:
                 self.target_theta = lidar_alert.get("theta", 0.0)
@@ -165,6 +212,11 @@ class DecisionFSM:
             else:
                 return "CMD:STOP", "Ispezione visiva 3D mirata"
 
-        # Livello 5: Marcia regolare avanti libera (AVANTI)
+        # Livello 5: Marcia regolare avanti / Controllo Pitch salita o discesa
         self.set_state(RobotState.PATROL_FORWARD, "Marcia regolare libera")
-        return f"CMD:FORWARD,{self.forward_speed}", f"[MARCIA REGOLARE] Fronte: {dist_critica_fronte:.0f}cm"
+        if pitch_robot > 15.0:
+            return f"CMD:FORWARD,{self.forward_speed}", f"[PITCH ELEVATO: SALITA] Pitch: {pitch_robot:.1f}°"
+        elif pitch_robot < -15.0:
+            return "CMD:BACKWARD,30", f"[PITCH NEGATIVO: DISCESA] Pitch: {pitch_robot:.1f}°"
+        else:
+            return f"CMD:FORWARD,{self.forward_speed}", f"[MARCIA REGOLARE] Fronte: {dist_critica_fronte:.0f}cm"

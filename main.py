@@ -13,6 +13,7 @@ import signal
 
 from fsm import DecisionFSM, RobotState
 from attention_controller import AttentionController
+from imu_fusion import IMUFusion
 
 try:
     import paho.mqtt.client as mqtt
@@ -21,37 +22,67 @@ except ImportError:
 
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+IMU_CALIBRATION_SAMPLES = int(os.getenv("IMU_CALIBRATION_SAMPLES", "100"))
+IMU_CALIBRATION_TIMEOUT_S = float(os.getenv("IMU_CALIBRATION_TIMEOUT_S", "12"))
 
 fsm = DecisionFSM(forward_speed=50, critical_distance_cm=35.0)
 attention = AttentionController(settle_time_sec=0.4)
+imu_fusion = IMUFusion(
+    calibration_samples=IMU_CALIBRATION_SAMPLES,
+    calibration_timeout_s=IMU_CALIBRATION_TIMEOUT_S
+)
 
 latest_lidar_alert = None
 latest_vision_objects = None
 latest_ground_hazard = None
+latest_imu_data = None
 latest_ultrasonic_cm = -1.0
 running = True
 mqtt_client = None
 
 
 def on_mqtt_message(client, userdata, msg):
-    global latest_lidar_alert, latest_vision_objects, latest_ground_hazard, latest_ultrasonic_cm
+    global latest_lidar_alert, latest_vision_objects, latest_ground_hazard, latest_imu_data, latest_ultrasonic_cm
     topic = msg.topic
     try:
         data = json.loads(msg.payload.decode("utf-8"))
     except Exception:
         return
 
-    if topic == "mar/lidar/alert":
+    if topic in ("mar/lidar/alert", "mar/lidar/telemetry"):
         latest_lidar_alert = data
+    elif topic == "mar/lidar/scan":
+        if latest_lidar_alert is None:
+            latest_lidar_alert = data
+        else:
+            if "sector_mins" in data:
+                latest_lidar_alert["sector_mins"] = data["sector_mins"]
+            if "front_distance_m" in data:
+                latest_lidar_alert["front_distance_m"] = data["front_distance_m"]
     elif topic == "mar/vision/detections":
         latest_vision_objects = data
     elif topic == "mar/vision/ground_hazard":
         latest_ground_hazard = data
+    elif topic == "mar/imu/raw":
+        # Raw IMU samples from mar-serial-bridge -> Kalman quaternion fusion
+        imu_fusion.feed(data)
+    elif topic == "mar/imu/telemetry":
+        latest_imu_data = data
     elif topic == "mar/hardware/telemetry":
         # Extract ultrasonic if present
         if "ultrasonic" in data:
             try:
                 latest_ultrasonic_cm = float(data["ultrasonic"])
+            except Exception:
+                pass
+        # Extract IMU roll/pitch from Arduino telemetry if available
+        if "roll" in data and "pitch" in data:
+            try:
+                latest_imu_data = {
+                    "roll": float(data["roll"]),
+                    "pitch": float(data["pitch"]),
+                    "timestamp": time.time()
+                }
             except Exception:
                 pass
     elif topic == "mar/safety/estop":
@@ -67,7 +98,7 @@ def signal_handler(sig, frame):
 
 
 def main():
-    global running, mqtt_client
+    global running, mqtt_client, latest_imu_data
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -85,8 +116,12 @@ def main():
             mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
             mqtt_client.subscribe([
                 ("mar/lidar/alert", 0),
+                ("mar/lidar/telemetry", 0),
+                ("mar/lidar/scan", 0),
                 ("mar/vision/detections", 0),
                 ("mar/vision/ground_hazard", 0),
+                ("mar/imu/raw", 0),
+                ("mar/imu/telemetry", 0),
                 ("mar/hardware/telemetry", 0),
                 ("mar/safety/estop", 2)
             ])
@@ -100,12 +135,18 @@ def main():
     last_cmd = ""
 
     while running:
+        # Attitude from the quaternion Kalman filter (fresh samples from mar-serial-bridge)
+        fused_imu = imu_fusion.latest(max_age_s=1.0)
+        if fused_imu is not None:
+            latest_imu_data = fused_imu
+
         # Esegui tick FSM
         cmd, reason = fsm.update(
             lidar_alert=latest_lidar_alert,
             vision_objects=latest_vision_objects,
             ultrasonic_distance_cm=latest_ultrasonic_cm,
-            ground_hazard_alert=latest_ground_hazard
+            ground_hazard_alert=latest_ground_hazard,
+            imu_data=latest_imu_data
         )
 
         # Se il comando cambia o a intervalli periodici, invia a mar-serial-bridge
@@ -134,6 +175,10 @@ def main():
                 "timestamp": time.time()
             }
             mqtt_client.publish("mar/fsm/state", json.dumps(state_payload))
+
+            # Assetto filtrato (Kalman) per dashboard, LoRa e telemetria
+            if fused_imu is not None:
+                mqtt_client.publish("mar/imu/telemetry", json.dumps(fused_imu))
 
         time.sleep(0.05)  # 20 Hz update loop
 

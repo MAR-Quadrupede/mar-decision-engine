@@ -12,6 +12,7 @@
    - Ascolta i trigger perimetrali da `mar-lidar-service` (`mar/lidar/alert`).
    - Ascolta le classi semantiche, la griglia spaziale 3D e gli alert dislivelli da `mar-vision-service` (`mar/vision/detections`, `mar/vision/ground_hazard`).
    - Monitora la telemetria degli ultrasuoni e della batteria da `mar-serial-bridge` (`mar/hardware/telemetry`).
+   - Esegue la **fusione inerziale**: riceve i campioni grezzi da `mar/imu/raw`, applica il filtro di Kalman a quaternioni (`imu_filter.py`), calibra automaticamente i bias a robot fermo e pubblica roll/pitch/yaw su `mar/imu/telemetry`.
 2. **Macchina a Stati Finita (Safety FSM)**:
    - `IDLE`: quadrupede in attesa con assetto eretto.
    - `PATROL_FORWARD`: marcia autonoma in avanti con scansione di sicurezza attiva (`AVANTI` / `CMD:FORWARD`).
@@ -32,6 +33,8 @@
 | `mar/vision/detections` | In ingresso (Sub) | `{"count": 1, "objects": [...], "spatial_grid_3d": {...}}` | Ostacoli 3D e griglia spaziale a 9 zone |
 | `mar/vision/ground_hazard` | In ingresso (Sub) | `{"z_basso_cm": 35.0, "hazard": "TERRAIN_OR_LOW_OBSTACLE"}` | Notifica dislivello o scalino a terra |
 | `mar/hardware/telemetry` | In ingresso (Sub) | `{"ultrasonic": "28.5", "batt": "11.8"}` | Telemetria fisica da Arduino |
+| `mar/imu/raw` | In ingresso (Sub) | `{"timestamp": ..., "gyro": [...], "acc": [...], "gyro_scale": 131.0, "accel_scale": 16384.0}` | Campioni IMU grezzi da `mar-serial-bridge` |
+| `mar/imu/telemetry` | In uscita (Pub) | `{"timestamp": ..., "roll": 1.2, "pitch": -0.8, "yaw": 45.0}` | Assetto filtrato (Kalman) per dashboard, LoRa e FSM |
 | `mar/safety/estop` | In ingresso (Sub) | `{"reason": "OPERATOR"}` | Segnale di stop prioritario |
 | `mar/control/motion` | In uscita (Pub) | `{"cmd": "FORWARD", "param": "50", "reason": "PATROL"}` | Comando per `mar-serial-bridge` |
 | `mar/fsm/state` | In uscita (Pub) | `{"state": "PATROL_FORWARD", "active_command": "CMD:FORWARD,50"}` | Stato per la `mar-dashboard` |
@@ -45,6 +48,8 @@ mar-decision-engine/
 ├── README.md                  # Questo documento
 ├── requirements.txt           # paho-mqtt, numpy
 ├── fsm.py                     # Macchina a stati finita con regole deterministiche e multi-level safety
+├── imu_filter.py              # Filtro di Kalman a quaternioni (porting di IMUKalmanFilter.py)
+├── imu_fusion.py              # Calibrazione streaming + fusione IMU e pubblicazione assetto
 ├── attention_controller.py    # Logica per puntamento attivo (Saccade) e motion-blur gating
 ├── obstacle_avoidance.py      # Algoritmi di punteggio rischio e clearance ostacoli
 └── main.py                    # Demone del microservizio
