@@ -27,10 +27,10 @@ IMU_CALIBRATION_TIMEOUT_S = float(os.getenv("IMU_CALIBRATION_TIMEOUT_S", "12"))
 
 fsm = DecisionFSM(
     forward_speed=50,
-    critical_distance_cm=40.0,
-    high_distance_cm=70.0,
+    critical_distance_cm=30.0,
+    high_distance_cm=65.0,
     moderate_distance_cm=120.0,
-    slow_warning_cm=70.0,
+    slow_warning_cm=65.0,
 )
 attention = AttentionController(settle_time_sec=0.4)
 imu_fusion = IMUFusion(
@@ -43,8 +43,23 @@ latest_vision_objects = None
 latest_ground_hazard = None
 latest_imu_data = None
 latest_ultrasonic_cm = -1.0
+latest_ultrasonic_ts = 0.0
 running = True
 mqtt_client = None
+
+
+def _ingest_ultrasonic(data: dict):
+    global latest_ultrasonic_cm, latest_ultrasonic_ts
+    for key in ("us_cm", "ultrasonic_cm", "ultrasonic", "us"):
+        if key in data and data[key] is not None:
+            try:
+                val = float(data[key])
+                if 2.0 <= val <= 400.0:
+                    latest_ultrasonic_cm = val
+                    latest_ultrasonic_ts = float(data.get("timestamp") or time.time())
+                    return
+            except Exception:
+                pass
 
 
 def on_mqtt_message(client, userdata, msg):
@@ -85,13 +100,10 @@ def on_mqtt_message(client, userdata, msg):
         imu_fusion.feed(data)
     elif topic == "mar/imu/telemetry":
         latest_imu_data = data
+    elif topic == "mar/ultrasonic/range":
+        _ingest_ultrasonic(data)
     elif topic == "mar/hardware/telemetry":
-        # Extract ultrasonic if present
-        if "ultrasonic" in data:
-            try:
-                latest_ultrasonic_cm = float(data["ultrasonic"])
-            except Exception:
-                pass
+        _ingest_ultrasonic(data)
         # Extract IMU roll/pitch from Arduino telemetry if available
         if "roll" in data and "pitch" in data:
             try:
@@ -146,6 +158,7 @@ def main():
                     ("mar/imu/raw", 0),
                     ("mar/imu/telemetry", 0),
                     ("mar/hardware/telemetry", 0),
+                    ("mar/ultrasonic/range", 0),
                     ("mar/safety/estop", 2),
                     ("mar/safety/resume", 1),
                 ])
@@ -169,11 +182,16 @@ def main():
         if fused_imu is not None:
             latest_imu_data = fused_imu
 
+        # Ultrasuoni solo se freschi (<0.6s)
+        us_cm = latest_ultrasonic_cm
+        if us_cm > 0 and (time.time() - latest_ultrasonic_ts) > 0.6:
+            us_cm = -1.0
+
         # Esegui tick FSM
         cmd, reason = fsm.update(
             lidar_alert=latest_lidar_alert,
             vision_objects=latest_vision_objects,
-            ultrasonic_distance_cm=latest_ultrasonic_cm,
+            ultrasonic_distance_cm=us_cm,
             ground_hazard_alert=latest_ground_hazard,
             imu_data=latest_imu_data
         )
@@ -201,7 +219,8 @@ def main():
                 "state": fsm.state.name,
                 "active_command": cmd,
                 "reason": reason,
-                "timestamp": time.time()
+                "timestamp": time.time(),
+                "fusion": getattr(fsm, "last_fusion_meta", {}),
             }
             mqtt_client.publish("mar/fsm/state", json.dumps(state_payload))
 

@@ -14,6 +14,13 @@ from enum import Enum, auto
 import time
 from typing import Dict, Optional, Tuple, Any
 
+try:
+    from safety_bands import RiskDecisionStabilizer, EXIT_CRITICAL_CM, EXIT_MODERATE_CM
+    from sensor_fusion import FrontRangeFusion
+except ImportError:
+    from .safety_bands import RiskDecisionStabilizer, EXIT_CRITICAL_CM, EXIT_MODERATE_CM
+    from .sensor_fusion import FrontRangeFusion
+
 
 class RobotState(Enum):
     IDLE = auto()
@@ -30,11 +37,11 @@ class DecisionFSM:
     def __init__(
         self,
         forward_speed: int = 50,
-        critical_distance_cm: float = 40.0,   # CRITICAL → STOP
-        high_distance_cm: float = 70.0,       # HIGH → FRENA
-        moderate_distance_cm: float = 120.0,  # MODERATE → avanti lento
-        ground_hazard_cm: float = 40.0,
-        slow_warning_cm: float = 70.0,
+        critical_distance_cm: float = 30.0,   # CRITICAL STOP immediato (< 30 cm)
+        high_distance_cm: float = 65.0,       # Deviazione / schivamento dinamico (< 65 cm)
+        moderate_distance_cm: float = 120.0,  # Allerta periferica (< 120 cm)
+        ground_hazard_cm: float = 40.0,       # Ostacolo a terra / dislivello (< 40 cm)
+        slow_warning_cm: float = 65.0,        # Rallentamento / schivata (< 65 cm)
     ):
         self.state = RobotState.IDLE
         self.forward_speed = forward_speed
@@ -50,6 +57,11 @@ class DecisionFSM:
         self.avoidance_start_time: float = 0.0
         # Operator / dashboard E-STOP stays latched until explicit resume
         self.operator_estop: bool = False
+        # Fusione frontale ponderata (niente oscillazioni LOW↔CRITICAL)
+        self.front_risk = RiskDecisionStabilizer(ema_alpha=0.28, escalate_s=0.22, deescalate_s=1.1)
+        # Layered fusion stile Nav2 (US Range + LiDAR Obstacle + stereo corroboration)
+        self.range_fusion = FrontRangeFusion(agree_ratio=0.35)
+        self.last_fusion_meta: Dict[str, Any] = {}
 
     def set_state(self, new_state: RobotState, reason: str = ""):
         if self.state != new_state:
@@ -188,54 +200,74 @@ class DecisionFSM:
                 if str(vision_objects.get("risk_level", "")).upper() == "CRITICAL":
                     vision_target_cm = min(vision_target_cm, self.critical_distance_cm * 0.8)
 
-        candidati_fronte = []
-        if lidar_front_cm < 900.0:
-            candidati_fronte.append(lidar_front_cm)
-        if z_basso_cm < 900.0:
-            candidati_fronte.append(z_basso_cm)
-        if z_centro_cm < 900.0:
-            candidati_fronte.append(z_centro_cm)
-        if vision_target_cm < 900.0:
-            candidati_fronte.append(vision_target_cm)
-        if ultrasonic_distance_cm > 0:
-            candidati_fronte.append(ultrasonic_distance_cm)
+        # Fusione layered (Nav2-inspired) — vedi sensor_fusion.py
+        stereo_for_fuse = vision_target_cm if vision_target_cm < 900.0 else (
+            z_centro_cm if z_centro_cm < 900.0 else 999.0
+        )
+        dist_raw_fronte, fuse_meta = self.range_fusion.fuse(
+            ultrasonic_cm=float(ultrasonic_distance_cm),
+            lidar_front_cm=float(lidar_front_cm),
+            stereo_cm=float(stereo_for_fuse),
+        )
+        self.last_fusion_meta = fuse_meta
 
-        dist_critica_fronte = min(candidati_fronte) if candidati_fronte else 999.0
+        # Preferisci risk già stabilizzato dalla vision se fresco e più severo
+        vision_risk = ""
+        if vision_objects:
+            t_vr = vision_objects.get("timestamp", now)
+            if now - t_vr < 1.0:
+                vision_risk = str(vision_objects.get("risk_level", "") or "").upper()
 
-        # 4. Bande unificate CRITICAL / HIGH / MODERATE / LOW
-        # CRITICAL → STOP immediato
+        risk_level, dist_critica_fronte = self.front_risk.update(dist_raw_fronte, now=now)
+        # Accordo con vision: se vision tiene CRITICAL/HIGH, non sottostimare
+        if vision_risk == "CRITICAL" and risk_level != "CRITICAL":
+            # Accelera pending verso CRITICAL senza saltare il confirm interno:
+            # forza un update con distanza sotto soglia critica
+            risk_level, dist_critica_fronte = self.front_risk.update(
+                min(dist_critica_fronte, self.critical_distance_cm * 0.7), now=now
+            )
+        elif vision_risk == "HIGH" and risk_level in ("LOW", "MODERATE"):
+            risk_level, dist_critica_fronte = self.front_risk.update(
+                min(dist_critica_fronte, self.high_distance_cm * 0.85), now=now
+            )
+
+        # 4. Gerarchia decisionale multi-livello reattiva (ispirata a canelidarstereoimudef2)
+        # Livello 1: Collisione imminente (< 30 cm)
         if dist_critica_fronte < self.critical_distance_cm:
             if self.state != RobotState.EMERGENCY_STOP:
                 self.set_state(
                     RobotState.EMERGENCY_STOP,
-                    f"CRITICAL frontale {dist_critica_fronte:.0f}cm < {self.critical_distance_cm:.0f}cm",
+                    f"Ostacolo critico frontale ({dist_critica_fronte:.0f}cm < {self.critical_distance_cm:.0f}cm)",
                 )
-            return "CMD:STOP", f"[CRITICAL] Ostacolo a {dist_critica_fronte:.0f}cm"
+            return "CMD:STOP", f"[STOP EMERGENCY] Ostacolo a {dist_critica_fronte:.0f}cm"
 
-        # Terrain hazard
+        # Livello 2: Dislivello / gradino a terra (< 40 cm)
         if has_ground_hazard and (z_basso_cm < self.ground_hazard_cm):
             if self.state != RobotState.TERRAIN_HAZARD:
                 self.set_state(RobotState.TERRAIN_HAZARD, f"Dislivello a terra (Z_basso={z_basso_cm:.0f} cm)")
             return "CMD:STOP_TERRA", f"[OSTACOLO A TERRA] Z_basso: {z_basso_cm:.0f}cm"
 
+        # Se eravamo in arresto ma la strada è ora libera (> 65 cm), rientra subito in marcia
         if self.state in (RobotState.EMERGENCY_STOP, RobotState.TERRAIN_HAZARD) and not self.operator_estop:
-            if dist_critica_fronte >= self.moderate_distance_cm and not has_ground_hazard:
-                self.set_state(RobotState.PATROL_FORWARD, "Via libera confermata dai sensori 3D/LiDAR")
+            if dist_critica_fronte >= self.slow_warning_cm and not has_ground_hazard:
+                self.set_state(RobotState.PATROL_FORWARD, "Via libera confermata")
+            else:
+                return "CMD:STOP", f"[HOLD SICUREZZA] fronte={dist_critica_fronte:.0f}cm"
 
-        # HIGH → frena (niente svolta se ostacolo frontale vicino)
-        if dist_critica_fronte < self.high_distance_cm:
+        # Livello 3: Ostacolo a media distanza (< 65 cm) -> Deviazione attiva (GIRA_DX / GIRA_SX)
+        if dist_critica_fronte < self.slow_warning_cm:
+            if d_dx >= d_sx:
+                direction = "RIGHT"
+                turn_cmd = "CMD:TURN_R,45"
+            else:
+                direction = "LEFT"
+                turn_cmd = "CMD:TURN_L,45"
+
+            self.avoidance_direction = direction
+            self.avoidance_start_time = now
             if self.state != RobotState.AVOIDANCE:
-                self.set_state(RobotState.AVOIDANCE, f"HIGH: ostacolo a {dist_critica_fronte:.0f}cm")
-            return "CMD:STOP", f"[HIGH/FRENA] Ostacolo a {dist_critica_fronte:.0f}cm"
-
-        # MODERATE → avanti lento; se laterale chiaro può scostarsi
-        if dist_critica_fronte < self.moderate_distance_cm:
-            slow = max(15, self.forward_speed // 2)
-            if min(d_dx, d_sx) < 40.0 and abs(d_dx - d_sx) > 25.0:
-                if d_dx >= d_sx:
-                    return "CMD:TURN_R,25", f"[MODERATE] Scosto DX (fronte {dist_critica_fronte:.0f}cm)"
-                return "CMD:TURN_L,25", f"[MODERATE] Scosto SX (fronte {dist_critica_fronte:.0f}cm)"
-            return f"CMD:FORWARD,{slow}", f"[MODERATE] Avanti lento {slow}% (fronte {dist_critica_fronte:.0f}cm)"
+                self.set_state(RobotState.AVOIDANCE, f"Ostacolo a {dist_critica_fronte:.0f}cm -> Deviazione {direction}")
+            return turn_cmd, f"[DEVIAZIONE {direction}] DX:{d_dx:.0f}cm | SX:{d_sx:.0f}cm"
 
         # Livello 4: saccade solo su settori frontali (come canelidarstereoimudef2:
         # un muro laterale puro non deve congelare la marcia in INSPECTING).
