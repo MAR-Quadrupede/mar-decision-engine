@@ -58,10 +58,34 @@ def _ingest_ultrasonic(data: dict):
                 val = float(data[key])
                 if 2.0 <= val <= 400.0:
                     latest_ultrasonic_cm = val
-                    latest_ultrasonic_ts = float(data.get("timestamp") or time.time())
+                    latest_ultrasonic_ts = time.time()
                     return
             except Exception:
                 pass
+
+
+def on_mqtt_connect(client, userdata, flags, rc, properties=None):
+    if rc == 0:
+        print(f"  ✓ MQTT on_connect: Sottoscrizione ai topic di sistema (rc={rc})")
+        client.subscribe([
+            ("mar/slam/pose", 0),
+            ("mar/slam/map", 0),
+            ("mar/lidar/alert", 0),
+            ("mar/lidar/telemetry", 0),
+            ("mar/lidar/scan", 0),
+            ("mar/vision/detections", 0),
+            ("mar/vision/command", 0),
+            ("mar/vision/motion", 0),
+            ("mar/vision/ground_hazard", 0),
+            ("mar/imu/raw", 0),
+            ("mar/imu/telemetry", 0),
+            ("mar/hardware/telemetry", 0),
+            ("mar/ultrasonic/range", 0),
+            ("mar/safety/estop", 2),
+            ("mar/safety/resume", 1),
+        ])
+    else:
+        print(f"  ✗ MQTT on_connect fallito con codice rc={rc}")
 
 
 def on_mqtt_message(client, userdata, msg):
@@ -152,30 +176,14 @@ def main():
 
     if mqtt:
         mqtt_client = mqtt.Client(client_id="mar-decision-engine")
+        mqtt_client.on_connect = on_mqtt_connect
         mqtt_client.on_message = on_mqtt_message
         connected = False
         for attempt in range(1, 16):
             try:
                 mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-                mqtt_client.subscribe([
-                    ("mar/slam/pose", 0),
-                    ("mar/slam/map", 0),
-                    ("mar/lidar/alert", 0),
-                    ("mar/lidar/telemetry", 0),
-                    ("mar/lidar/scan", 0),
-                    ("mar/vision/detections", 0),
-                    ("mar/vision/command", 0),
-                    ("mar/vision/motion", 0),
-                    ("mar/vision/ground_hazard", 0),
-                    ("mar/imu/raw", 0),
-                    ("mar/imu/telemetry", 0),
-                    ("mar/hardware/telemetry", 0),
-                    ("mar/ultrasonic/range", 0),
-                    ("mar/safety/estop", 2),
-                    ("mar/safety/resume", 1),
-                ])
                 mqtt_client.loop_start()
-                print(f"  ✓ Connesso a MQTT Broker ({MQTT_BROKER}:{MQTT_PORT})")
+                print(f"  ✓ Avviato loop MQTT verso ({MQTT_BROKER}:{MQTT_PORT})")
                 connected = True
                 break
             except Exception as e:
@@ -194,9 +202,9 @@ def main():
         if fused_imu is not None:
             latest_imu_data = fused_imu
 
-        # Ultrasuoni solo se freschi (<0.6s)
+        # Ultrasuoni solo se freschi (< 1.5s)
         us_cm = latest_ultrasonic_cm
-        if us_cm > 0 and (time.time() - latest_ultrasonic_ts) > 0.6:
+        if us_cm > 0 and (time.time() - latest_ultrasonic_ts) > 1.5:
             us_cm = -1.0
 
         # Esegui tick FSM
@@ -232,6 +240,7 @@ def main():
                 "state": fsm.state.name,
                 "active_command": cmd,
                 "reason": reason,
+                "risk_level": getattr(fsm.front_risk, "held_level", "LOW"),
                 "timestamp": time.time(),
                 "fusion": getattr(fsm, "last_fusion_meta", {}),
                 "slam_pose": latest_slam_pose,

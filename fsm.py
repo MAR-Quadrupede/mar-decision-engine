@@ -251,7 +251,15 @@ class DecisionFSM:
         EXIT_CRITICAL_DIST_CM = 55.0  # Isteresi uscita da stop: deve vedere almeno 55cm liberi
         EXIT_AVOIDANCE_DIST_CM = 75.0 # Isteresi uscita da deviazione: deve vedere almeno 75cm liberi
 
-        # Livello 0: Anticipazione predittiva per avvicinamento rapido (TTC < 1.4s)
+        # Livello 0: Sicurezza Assoluta Ultrasuoni Diretto (< 30 cm)
+        if 0.0 < ultrasonic_distance_cm < self.critical_distance_cm:
+            self.set_state(
+                RobotState.EMERGENCY_STOP,
+                f"Ostacolo critico ultrasuoni ({ultrasonic_distance_cm:.0f}cm < {self.critical_distance_cm:.0f}cm)",
+            )
+            return "CMD:STOP", f"[STOP ULTRASUONI] Ostacolo a {ultrasonic_distance_cm:.0f}cm"
+
+        # Livello 0b: Anticipazione predittiva per avvicinamento rapido (TTC < 1.4s)
         if ttc < 1.4 and dist_critica_fronte < self.slow_warning_cm:
             self.set_state(
                 RobotState.EMERGENCY_STOP,
