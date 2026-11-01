@@ -86,7 +86,8 @@ class DecisionFSM:
         vision_objects: Optional[Dict],
         ultrasonic_distance_cm: float = -1.0,
         ground_hazard_alert: Optional[Dict] = None,
-        imu_data: Optional[Dict] = None
+        imu_data: Optional[Dict] = None,
+        motion_data: Optional[Dict] = None
     ) -> Tuple[str, str]:
         """
         Processes multi-sensor inputs (LiDAR 360°, Stereo 3D Vision, IMU Kalman, Ultrasonic)
@@ -137,6 +138,14 @@ class DecisionFSM:
                 elif sec_mins.get("Fronte") is not None or sec_mins.get("FRONT") is not None:
                     val_f = sec_mins.get("Fronte") if sec_mins.get("Fronte") is not None else sec_mins.get("FRONT")
                     lidar_front_cm = float(val_f) * 100.0 if float(val_f) < 15.0 else float(val_f)
+
+                # Se un ostacolo imminente (< 30cm) invade i settori angolari frontali (Front-DX o Front-SX)
+                for adj_key in ("Front-DX", "FRONT_RIGHT", "Front-SX", "FRONT_LEFT"):
+                    if sec_mins.get(adj_key) is not None:
+                        val_adj = float(sec_mins[adj_key])
+                        cm_adj = val_adj * 100.0 if val_adj < 15.0 else val_adj
+                        if cm_adj < self.critical_distance_cm:
+                            lidar_front_cm = min(lidar_front_cm, cm_adj)
 
                 # Spazi laterali per deviazione (Destra vs Sinistra)
                 val_dx = (
@@ -200,14 +209,18 @@ class DecisionFSM:
                 if str(vision_objects.get("risk_level", "")).upper() == "CRITICAL":
                     vision_target_cm = min(vision_target_cm, self.critical_distance_cm * 0.8)
 
-        # Fusione layered (Nav2-inspired) — vedi sensor_fusion.py
+        # Fusione layered ponderata con safety override
         stereo_for_fuse = vision_target_cm if vision_target_cm < 900.0 else (
             z_centro_cm if z_centro_cm < 900.0 else 999.0
         )
+        motion_vz = float(motion_data.get("velocity_z_cms", 0.0)) if motion_data else 0.0
+        ttc = float(motion_data.get("ttc_sec", 999.0)) if motion_data else 999.0
+
         dist_raw_fronte, fuse_meta = self.range_fusion.fuse(
             ultrasonic_cm=float(ultrasonic_distance_cm),
             lidar_front_cm=float(lidar_front_cm),
             stereo_cm=float(stereo_for_fuse),
+            motion_vz_cms=motion_vz,
         )
         self.last_fusion_meta = fuse_meta
 
@@ -232,6 +245,15 @@ class DecisionFSM:
             )
 
         # 4. Gerarchia decisionale multi-livello reattiva (ispirata a canelidarstereoimudef2)
+        # Livello 0: Anticipazione predittiva per avvicinamento rapido (TTC < 1.4s)
+        if ttc < 1.4 and dist_critica_fronte < self.slow_warning_cm:
+            if self.state != RobotState.EMERGENCY_STOP:
+                self.set_state(
+                    RobotState.EMERGENCY_STOP,
+                    f"Rischio impatto imminente (TTC: {ttc:.1f}s, Vz: {motion_vz:.0f}cm/s)",
+                )
+            return "CMD:STOP", f"[STOP IMPATTO IMMINENTE] TTC: {ttc:.1f}s (Vz: {motion_vz:.0f}cm/s)"
+
         # Livello 1: Collisione imminente (< 30 cm)
         if dist_critica_fronte < self.critical_distance_cm:
             if self.state != RobotState.EMERGENCY_STOP:

@@ -42,6 +42,7 @@ latest_lidar_alert = None
 latest_vision_objects = None
 latest_ground_hazard = None
 latest_imu_data = None
+latest_motion_data = None
 latest_ultrasonic_cm = -1.0
 latest_ultrasonic_ts = 0.0
 running = True
@@ -63,7 +64,7 @@ def _ingest_ultrasonic(data: dict):
 
 
 def on_mqtt_message(client, userdata, msg):
-    global latest_lidar_alert, latest_vision_objects, latest_ground_hazard, latest_imu_data, latest_ultrasonic_cm
+    global latest_lidar_alert, latest_vision_objects, latest_ground_hazard, latest_imu_data, latest_ultrasonic_cm, latest_motion_data
     topic = msg.topic
     try:
         data = json.loads(msg.payload.decode("utf-8"))
@@ -80,8 +81,13 @@ def on_mqtt_message(client, userdata, msg):
                 latest_lidar_alert["sector_mins"] = data["sector_mins"]
             if "front_distance_m" in data:
                 latest_lidar_alert["front_distance_m"] = data["front_distance_m"]
+            latest_lidar_alert["timestamp"] = data.get("timestamp", time.time())
+    elif topic == "mar/vision/motion":
+        latest_motion_data = data
     elif topic == "mar/vision/detections":
         latest_vision_objects = data
+        if "motion" in data:
+            latest_motion_data = data["motion"]
     elif topic == "mar/vision/command":
         # Merge command risk/distance into detections for FSM fusion
         if latest_vision_objects is None:
@@ -154,6 +160,7 @@ def main():
                     ("mar/lidar/scan", 0),
                     ("mar/vision/detections", 0),
                     ("mar/vision/command", 0),
+                    ("mar/vision/motion", 0),
                     ("mar/vision/ground_hazard", 0),
                     ("mar/imu/raw", 0),
                     ("mar/imu/telemetry", 0),
@@ -193,7 +200,8 @@ def main():
             vision_objects=latest_vision_objects,
             ultrasonic_distance_cm=us_cm,
             ground_hazard_alert=latest_ground_hazard,
-            imu_data=latest_imu_data
+            imu_data=latest_imu_data,
+            motion_data=latest_motion_data
         )
 
         # Se il comando cambia o a intervalli periodici, invia a mar-serial-bridge
