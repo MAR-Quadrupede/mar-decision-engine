@@ -58,7 +58,7 @@ class DecisionFSM:
         # Operator / dashboard E-STOP stays latched until explicit resume
         self.operator_estop: bool = False
         # Fusione frontale ponderata (niente oscillazioni LOW↔CRITICAL)
-        self.front_risk = RiskDecisionStabilizer(ema_alpha=0.28, escalate_s=0.22, deescalate_s=1.1)
+        self.front_risk = RiskDecisionStabilizer(ema_alpha=0.25, escalate_s=0.35, deescalate_s=2.0)
         # Layered fusion stile Nav2 (US Range + LiDAR Obstacle + stereo corroboration)
         self.range_fusion = FrontRangeFusion(agree_ratio=0.35)
         self.last_fusion_meta: Dict[str, Any] = {}
@@ -244,75 +244,96 @@ class DecisionFSM:
                 min(dist_critica_fronte, self.high_distance_cm * 0.85), now=now
             )
 
-        # 4. Gerarchia decisionale multi-livello reattiva (ispirata a canelidarstereoimudef2)
+        # 4. Gerarchia decisionale multi-livello con isteresi e persistenza delle decisioni
+        MIN_HOLD_EMERGENCY_S = 2.0    # Minimo tempo di arresto prima di poter ripartire
+        MIN_HOLD_AVOIDANCE_S = 2.0    # Minimo tempo per completare una manovra di sterzata
+        MIN_HOLD_TERRAIN_S = 1.5      # Minimo tempo di stop per ostacolo a terra
+        EXIT_CRITICAL_DIST_CM = 55.0  # Isteresi uscita da stop: deve vedere almeno 55cm liberi
+        EXIT_AVOIDANCE_DIST_CM = 75.0 # Isteresi uscita da deviazione: deve vedere almeno 75cm liberi
+
         # Livello 0: Anticipazione predittiva per avvicinamento rapido (TTC < 1.4s)
         if ttc < 1.4 and dist_critica_fronte < self.slow_warning_cm:
-            if self.state != RobotState.EMERGENCY_STOP:
-                self.set_state(
-                    RobotState.EMERGENCY_STOP,
-                    f"Rischio impatto imminente (TTC: {ttc:.1f}s, Vz: {motion_vz:.0f}cm/s)",
-                )
+            self.set_state(
+                RobotState.EMERGENCY_STOP,
+                f"Rischio impatto imminente (TTC: {ttc:.1f}s, Vz: {motion_vz:.0f}cm/s)",
+            )
             return "CMD:STOP", f"[STOP IMPATTO IMMINENTE] TTC: {ttc:.1f}s (Vz: {motion_vz:.0f}cm/s)"
 
-        # Livello 1: Collisione imminente (< 30 cm)
+        # Livello 1: Collisione imminente (< 30 cm) -> Scatta IMMEDIATO
         if dist_critica_fronte < self.critical_distance_cm:
-            if self.state != RobotState.EMERGENCY_STOP:
-                self.set_state(
-                    RobotState.EMERGENCY_STOP,
-                    f"Ostacolo critico frontale ({dist_critica_fronte:.0f}cm < {self.critical_distance_cm:.0f}cm)",
-                )
+            self.set_state(
+                RobotState.EMERGENCY_STOP,
+                f"Ostacolo critico frontale ({dist_critica_fronte:.0f}cm < {self.critical_distance_cm:.0f}cm)",
+            )
             return "CMD:STOP", f"[STOP EMERGENCY] Ostacolo a {dist_critica_fronte:.0f}cm"
 
-        # Livello 2: Dislivello / gradino a terra (< 40 cm)
+        # Livello 2: Se siamo attualmente in EMERGENCY_STOP, mantieni l'arresto (hold time + isteresi)
+        if self.state == RobotState.EMERGENCY_STOP:
+            time_in_stop = now - self.state_enter_time
+            if self.operator_estop:
+                return "CMD:STOP", "[E-STOP OPERATORE BLOCCATO]"
+            if time_in_stop < MIN_HOLD_EMERGENCY_S:
+                return "CMD:STOP", f"[HOLD EMERGENCY STOP] {time_in_stop:.1f}s/{MIN_HOLD_EMERGENCY_S:.1f}s (fronte={dist_critica_fronte:.0f}cm)"
+            # Hold time trascorso: per uscire, la strada deve essere chiaramente libera
+            if dist_critica_fronte >= EXIT_CRITICAL_DIST_CM and not has_ground_hazard:
+                self.set_state(RobotState.PATROL_FORWARD, f"Via libera confermata (fronte={dist_critica_fronte:.0f}cm)")
+            else:
+                return "CMD:STOP", f"[ATTESA VIA LIBERA] fronte={dist_critica_fronte:.0f}cm < {EXIT_CRITICAL_DIST_CM:.0f}cm"
+
+        # Livello 3: Dislivello / gradino a terra (< 40 cm)
         if has_ground_hazard and (z_basso_cm < self.ground_hazard_cm):
-            if self.state != RobotState.TERRAIN_HAZARD:
-                self.set_state(RobotState.TERRAIN_HAZARD, f"Dislivello a terra (Z_basso={z_basso_cm:.0f} cm)")
+            self.set_state(RobotState.TERRAIN_HAZARD, f"Dislivello a terra (Z_basso={z_basso_cm:.0f} cm)")
             return "CMD:STOP_TERRA", f"[OSTACOLO A TERRA] Z_basso: {z_basso_cm:.0f}cm"
 
-        # Se eravamo in arresto ma la strada è ora libera (> 65 cm), rientra subito in marcia
-        if self.state in (RobotState.EMERGENCY_STOP, RobotState.TERRAIN_HAZARD) and not self.operator_estop:
-            if dist_critica_fronte >= self.slow_warning_cm and not has_ground_hazard:
-                self.set_state(RobotState.PATROL_FORWARD, "Via libera confermata")
-            else:
-                return "CMD:STOP", f"[HOLD SICUREZZA] fronte={dist_critica_fronte:.0f}cm"
+        if self.state == RobotState.TERRAIN_HAZARD:
+            time_in_th = now - self.state_enter_time
+            if time_in_th < MIN_HOLD_TERRAIN_S or has_ground_hazard or z_basso_cm < 48.0:
+                return "CMD:STOP_TERRA", f"[HOLD TERRAIN HAZARD] Z_basso={z_basso_cm:.0f}cm"
+            self.set_state(RobotState.PATROL_FORWARD, "Terreno libero")
 
-        # Livello 3: Ostacolo a media distanza (< 65 cm) -> Deviazione attiva (GIRA_DX / GIRA_SX)
+        # Livello 4: Se siamo in AVOIDANCE (deviazione in corso), PORTA AVANTI LA DECISIONE!
+        if self.state == RobotState.AVOIDANCE:
+            time_in_avoid = now - self.state_enter_time
+            turn_cmd = "CMD:TURN_R,45" if self.avoidance_direction == "RIGHT" else "CMD:TURN_L,45"
+            # Deve mantenere la sterzata per almeno MIN_HOLD_AVOIDANCE_S
+            if time_in_avoid < MIN_HOLD_AVOIDANCE_S:
+                return turn_cmd, f"[CONTINUA DEVIAZIONE {self.avoidance_direction}] {time_in_avoid:.1f}s/{MIN_HOLD_AVOIDANCE_S:.1f}s"
+            # Se il tempo minimo è passato ed il fronte è ora libero
+            if dist_critica_fronte >= EXIT_AVOIDANCE_DIST_CM:
+                self.set_state(RobotState.PATROL_FORWARD, f"Deviazione conclusa con successo (fronte={dist_critica_fronte:.0f}cm)")
+            else:
+                # Fronte ancora occupato, continua la manovra
+                return turn_cmd, f"[MANOVRA CONTINUA {self.avoidance_direction}] fronte={dist_critica_fronte:.0f}cm"
+
+        # Livello 5: Ostacolo a media distanza (< 65 cm) -> Innesco nuova deviazione attiva
         if dist_critica_fronte < self.slow_warning_cm:
-            if d_dx >= d_sx:
-                direction = "RIGHT"
-                turn_cmd = "CMD:TURN_R,45"
-            else:
-                direction = "LEFT"
-                turn_cmd = "CMD:TURN_L,45"
-
+            direction = "RIGHT" if d_dx >= d_sx else "LEFT"
+            turn_cmd = "CMD:TURN_R,45" if direction == "RIGHT" else "CMD:TURN_L,45"
             self.avoidance_direction = direction
-            self.avoidance_start_time = now
-            if self.state != RobotState.AVOIDANCE:
-                self.set_state(RobotState.AVOIDANCE, f"Ostacolo a {dist_critica_fronte:.0f}cm -> Deviazione {direction}")
+            self.set_state(RobotState.AVOIDANCE, f"Ostacolo a {dist_critica_fronte:.0f}cm -> Inizio deviazione {direction}")
             return turn_cmd, f"[DEVIAZIONE {direction}] DX:{d_dx:.0f}cm | SX:{d_sx:.0f}cm"
 
-        # Livello 4: saccade solo su settori frontali (come canelidarstereoimudef2:
-        # un muro laterale puro non deve congelare la marcia in INSPECTING).
+        # Livello 6: Puntamento saccadico LiDAR (solo se in pattugliamento libero)
         sector = str(lidar_alert.get("sector", "") if lidar_alert else "")
         sector_en = str(lidar_alert.get("sector_en", "") if lidar_alert else "")
         frontal_sector = sector in ("Fronte", "Front-DX", "Front-SX") or sector_en in (
             "FRONT", "FRONT_RIGHT", "FRONT_LEFT"
         )
         if (
-            lidar_alert
+            self.state == RobotState.PATROL_FORWARD
+            and lidar_alert
             and lidar_alert.get("has_alert", False)
             and frontal_sector
             and abs(float(lidar_alert.get("theta", 0) or 0)) > 20
         ):
-            if self.state == RobotState.PATROL_FORWARD:
-                self.target_theta = float(lidar_alert.get("theta", 0.0) or 0.0)
-                self.set_state(RobotState.INSPECTING_OBJECT, f"LiDAR rileva ostacolo a θ={self.target_theta:.0f}°")
-                turn_cmd = (
-                    f"CMD:TURN_R,{abs(int(self.target_theta))}"
-                    if self.target_theta > 0
-                    else f"CMD:TURN_L,{abs(int(self.target_theta))}"
-                )
-                return turn_cmd, f"Puntamento saccadico verso θ={self.target_theta:.0f}°"
+            self.target_theta = float(lidar_alert.get("theta", 0.0) or 0.0)
+            self.set_state(RobotState.INSPECTING_OBJECT, f"LiDAR rileva ostacolo a θ={self.target_theta:.0f}°")
+            turn_cmd = (
+                f"CMD:TURN_R,{abs(int(self.target_theta))}"
+                if self.target_theta > 0
+                else f"CMD:TURN_L,{abs(int(self.target_theta))}"
+            )
+            return turn_cmd, f"Puntamento saccadico verso θ={self.target_theta:.0f}°"
 
         if self.state == RobotState.INSPECTING_OBJECT:
             if now - self.state_enter_time > 1.2:
@@ -320,8 +341,10 @@ class DecisionFSM:
             else:
                 return "CMD:STOP", "Ispezione visiva 3D mirata"
 
-        # Livello 5: Marcia regolare avanti / Controllo Pitch salita o discesa
-        self.set_state(RobotState.PATROL_FORWARD, "Marcia regolare libera")
+        # Livello 7: Marcia regolare avanti / Controllo Pitch salita o discesa
+        if self.state != RobotState.PATROL_FORWARD:
+            self.set_state(RobotState.PATROL_FORWARD, "Marcia regolare libera")
+
         if pitch_robot > 15.0:
             return f"CMD:FORWARD,{self.forward_speed}", f"[PITCH ELEVATO: SALITA] Pitch: {pitch_robot:.1f}°"
         elif pitch_robot < -15.0:

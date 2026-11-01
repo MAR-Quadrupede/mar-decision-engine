@@ -67,9 +67,9 @@ def _candidate_level_with_hysteresis(dist_cm: float, held: str) -> str:
 class RiskDecisionStabilizer:
     def __init__(
         self,
-        ema_alpha: float = 0.30,
-        escalate_s: float = 0.25,
-        deescalate_s: float = 1.0,
+        ema_alpha: float = 0.25,
+        escalate_s: float = 0.35,
+        deescalate_s: float = 2.0,
     ):
         self.ema_alpha = float(os.getenv("MAR_RISK_EMA_ALPHA", str(ema_alpha)))
         self.escalate_s = float(os.getenv("MAR_RISK_ESCALATE_S", str(escalate_s)))
@@ -105,7 +105,7 @@ class RiskDecisionStabilizer:
         elif cand_i > held_i:
             if _RISK_IDX.get(self.pending_level, -1) < cand_i:
                 self.pending_level = candidate
-            needed = min(self.escalate_s, 0.15) if candidate == "CRITICAL" else self.escalate_s
+            needed = self.escalate_s
             if (now - self.pending_since) >= needed:
                 self.held_level = candidate
                 self.pending_level = None
