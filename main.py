@@ -43,6 +43,7 @@ latest_vision_objects = None
 latest_ground_hazard = None
 latest_imu_data = None
 latest_motion_data = None
+latest_slam_pose = None
 latest_ultrasonic_cm = -1.0
 latest_ultrasonic_ts = 0.0
 running = True
@@ -64,14 +65,16 @@ def _ingest_ultrasonic(data: dict):
 
 
 def on_mqtt_message(client, userdata, msg):
-    global latest_lidar_alert, latest_vision_objects, latest_ground_hazard, latest_imu_data, latest_ultrasonic_cm, latest_motion_data
+    global latest_lidar_alert, latest_vision_objects, latest_ground_hazard, latest_imu_data, latest_ultrasonic_cm, latest_motion_data, latest_slam_pose
     topic = msg.topic
     try:
         data = json.loads(msg.payload.decode("utf-8"))
     except Exception:
         return
 
-    if topic in ("mar/lidar/alert", "mar/lidar/telemetry"):
+    if topic == "mar/slam/pose":
+        latest_slam_pose = data
+    elif topic in ("mar/lidar/alert", "mar/lidar/telemetry"):
         latest_lidar_alert = data
     elif topic == "mar/lidar/scan":
         if latest_lidar_alert is None:
@@ -155,6 +158,8 @@ def main():
             try:
                 mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
                 mqtt_client.subscribe([
+                    ("mar/slam/pose", 0),
+                    ("mar/slam/map", 0),
                     ("mar/lidar/alert", 0),
                     ("mar/lidar/telemetry", 0),
                     ("mar/lidar/scan", 0),
@@ -229,6 +234,7 @@ def main():
                 "reason": reason,
                 "timestamp": time.time(),
                 "fusion": getattr(fsm, "last_fusion_meta", {}),
+                "slam_pose": latest_slam_pose,
             }
             mqtt_client.publish("mar/fsm/state", json.dumps(state_payload))
 
