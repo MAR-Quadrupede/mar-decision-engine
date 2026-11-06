@@ -43,9 +43,9 @@ class SensorReading:
 
 
 # Pesi ponderati tarati sui sensori del robot MAR
-US_SPEC = dict(name="ultrasonic", min_cm=2.0, max_cm=350.0, weight=0.35, can_mark=True, can_clear=True)
-LIDAR_SPEC = dict(name="lidar_front", min_cm=10.0, max_cm=800.0, weight=0.35, can_mark=True, can_clear=True)
-STEREO_SPEC = dict(name="stereo", min_cm=20.0, max_cm=350.0, weight=0.30, can_mark=True, can_clear=True)
+US_SPEC = dict(name="ultrasonic", min_cm=2.0, max_cm=400.0, weight=0.35, can_mark=True, can_clear=True)
+LIDAR_SPEC = dict(name="lidar_front", min_cm=15.0, max_cm=800.0, weight=0.35, can_mark=True, can_clear=True)
+STEREO_SPEC = dict(name="stereo", min_cm=20.0, max_cm=450.0, weight=0.30, can_mark=True, can_clear=True)
 
 
 def _valid(r: SensorReading) -> bool:
@@ -85,13 +85,38 @@ class FrontRangeFusion:
 
         inputs = {r.name: round(r.dist_cm, 1) for r in valid}
 
-        # 1) Calcolo minimo assoluto per sicurezza critica
-        min_reading = min(valid, key=lambda r: r.dist_cm)
+        # 0) Cross-sensor validation (Verifica incrociata LiDAR vs Stereocamera e Ultrasuoni)
+        lidar_valid_reading = next((r for r in valid if r.name == "lidar_front"), None)
+        us_valid_reading = next((r for r in valid if r.name == "ultrasonic"), None)
+        stereo_valid_reading = next((r for r in valid if r.name == "stereo"), None)
+
+        lidar_status = "NORMAL"
+        filtered_valid = list(valid)
+
+        # Se il LiDAR rileva un ostacolo vicino (< 120 cm), verificalo con stereocamera e ultrasuoni
+        if lidar_valid_reading and lidar_valid_reading.dist_cm < 120.0:
+            us_clear = (us_valid_reading is not None and us_valid_reading.dist_cm >= 180.0)
+            stereo_clear = (stereo_valid_reading is not None and stereo_valid_reading.dist_cm >= 180.0)
+
+            # Entrambi i sensori ottico ed acustico confermano corridoio libero -> falso positivo LiDAR
+            if us_clear and stereo_clear:
+                lidar_status = "DISCREPANT_FALSE_POSITIVE"
+                filtered_valid = [r for r in valid if r.name != "lidar_front"]
+            elif (us_valid_reading and us_valid_reading.dist_cm < 120.0) or (stereo_valid_reading and stereo_valid_reading.dist_cm < 120.0):
+                lidar_status = "CONFIRMED_TRUE_POSITIVE"
+            else:
+                lidar_status = "UNCONFIRMED_LIDAR_ONLY"
+
+        if not filtered_valid:
+            filtered_valid = valid
+
+        # 1) Calcolo minimo assoluto per sicurezza critica sui sensori validati
+        min_reading = min(filtered_valid, key=lambda r: r.dist_cm)
         min_dist = min_reading.dist_cm
 
-        # 2) Equazione completa ponderata: media pesata dei sensori validi
-        total_weight = sum(r.weight for r in valid)
-        weighted_dist = sum(r.dist_cm * r.weight for r in valid) / max(0.001, total_weight)
+        # 2) Equazione completa ponderata: media pesata dei sensori validati
+        total_weight = sum(r.weight for r in filtered_valid)
+        weighted_dist = sum(r.dist_cm * r.weight for r in filtered_valid) / max(0.001, total_weight)
 
         # Regola di sicurezza:
         # Se un sensore rileva pericolo critico (< 30cm) o deviazione alta (< 65cm e c'è discrepanza),
@@ -110,6 +135,9 @@ class FrontRangeFusion:
             raw_fused = weighted_dist
             method = "full_weighted_fusion"
             primary_name = "weighted_all"
+
+        if lidar_status == "DISCREPANT_FALSE_POSITIVE":
+            method += "_lidar_discrepant_rejected"
 
         # Compensazione predittiva se l'oggetto si sta avvicinando velocemente (vz < -15 cm/s)
         if motion_vz_cms < -15.0 and raw_fused < 150.0:
@@ -144,4 +172,5 @@ class FrontRangeFusion:
             "weighted_cm": round(weighted_dist, 1),
             "min_cm": round(min_dist, 1),
             "fused_cm": round(fused, 1),
+            "lidar_validation": lidar_status,
         }

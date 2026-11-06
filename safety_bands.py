@@ -69,7 +69,7 @@ class RiskDecisionStabilizer:
         self,
         ema_alpha: float = 0.25,
         escalate_s: float = 0.35,
-        deescalate_s: float = 2.0,
+        deescalate_s: float = 0.6,
     ):
         self.ema_alpha = float(os.getenv("MAR_RISK_EMA_ALPHA", str(ema_alpha)))
         self.escalate_s = float(os.getenv("MAR_RISK_ESCALATE_S", str(escalate_s)))
@@ -89,7 +89,7 @@ class RiskDecisionStabilizer:
             self.dist_ema = raw
         else:
             a_near = min(0.75, self.ema_alpha + 0.25)
-            a_far = max(0.12, self.ema_alpha - 0.15)
+            a_far = 0.50 if raw >= 150.0 else max(0.20, self.ema_alpha - 0.10)
             a = a_near if raw < self.dist_ema else a_far
             self.dist_ema = (1.0 - a) * self.dist_ema + a * raw
 
@@ -110,11 +110,15 @@ class RiskDecisionStabilizer:
                 self.held_level = candidate
                 self.pending_level = None
         elif cand_i < held_i:
+            dwell_needed = 0.35 if self.dist_ema >= 150.0 else self.deescalate_s
             if self.pending_level != candidate:
                 self.pending_level = candidate
                 self.pending_since = now
-            elif (now - self.pending_since) >= self.deescalate_s:
-                self.held_level = RISK_LEVELS[held_i - 1]
+            elif (now - self.pending_since) >= dwell_needed:
+                if self.dist_ema >= 150.0:
+                    self.held_level = "LOW"
+                else:
+                    self.held_level = RISK_LEVELS[held_i - 1]
                 self.pending_level = None
 
         return self.held_level, float(self.dist_ema)

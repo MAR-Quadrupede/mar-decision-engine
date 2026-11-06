@@ -46,6 +46,7 @@ latest_motion_data = None
 latest_slam_pose = None
 latest_ultrasonic_cm = -1.0
 latest_ultrasonic_ts = 0.0
+decision_trigger = threading.Event()
 running = True
 mqtt_client = None
 
@@ -59,6 +60,7 @@ def _ingest_ultrasonic(data: dict):
                 if 2.0 <= val <= 400.0:
                     latest_ultrasonic_cm = val
                     latest_ultrasonic_ts = time.time()
+                    decision_trigger.set()
                     return
             except Exception:
                 pass
@@ -100,6 +102,7 @@ def on_mqtt_message(client, userdata, msg):
         latest_slam_pose = data
     elif topic in ("mar/lidar/alert", "mar/lidar/telemetry"):
         latest_lidar_alert = data
+        decision_trigger.set()
     elif topic == "mar/lidar/scan":
         if latest_lidar_alert is None:
             latest_lidar_alert = data
@@ -108,13 +111,18 @@ def on_mqtt_message(client, userdata, msg):
                 latest_lidar_alert["sector_mins"] = data["sector_mins"]
             if "front_distance_m" in data:
                 latest_lidar_alert["front_distance_m"] = data["front_distance_m"]
+            if "point_count" in data:
+                latest_lidar_alert["point_count"] = data["point_count"]
             latest_lidar_alert["timestamp"] = data.get("timestamp", time.time())
+        decision_trigger.set()
     elif topic == "mar/vision/motion":
         latest_motion_data = data
+        decision_trigger.set()
     elif topic == "mar/vision/detections":
         latest_vision_objects = data
         if "motion" in data:
             latest_motion_data = data["motion"]
+        decision_trigger.set()
     elif topic == "mar/vision/command":
         # Merge command risk/distance into detections for FSM fusion
         if latest_vision_objects is None:
@@ -126,8 +134,10 @@ def on_mqtt_message(client, userdata, msg):
             "risk_level": data.get("risk_level", latest_vision_objects.get("risk_level")),
             "timestamp": data.get("timestamp", time.time()),
         }
+        decision_trigger.set()
     elif topic == "mar/vision/ground_hazard":
         latest_ground_hazard = data
+        decision_trigger.set()
     elif topic == "mar/imu/raw":
         # Raw IMU samples from mar-serial-bridge -> Kalman quaternion fusion
         imu_fusion.feed(data)
@@ -150,9 +160,11 @@ def on_mqtt_message(client, userdata, msg):
     elif topic == "mar/safety/estop":
         print(f"🚨 [FSM E-STOP TRIGGERED]: {data}")
         fsm.trigger_operator_estop("E-Stop da operatore o sensore critico")
+        decision_trigger.set()
     elif topic == "mar/safety/resume":
         print(f"✅ [FSM RESUME]: {data}")
         fsm.clear_operator_estop("Resume da operatore")
+        decision_trigger.set()
 
 
 def signal_handler(sig, frame):
@@ -222,7 +234,6 @@ def main():
             last_cmd = cmd
             print(f"🤖 [DECISION]: {cmd} | {reason}")
             if mqtt_client and mqtt_client.is_connected():
-                # Estrai tipo comando e parametro (es. "CMD:FORWARD,50" -> cmd="FORWARD", param="50")
                 payload_cmd = cmd.replace("CMD:", "")
                 parts = payload_cmd.split(",", 1)
                 cmd_dict = {
@@ -234,15 +245,22 @@ def main():
                 }
                 mqtt_client.publish("mar/control/motion", json.dumps(cmd_dict))
 
-        # Pubblica stato FSM per la Dashboard (5 Hz)
+        # Pubblica stato FSM unificato per la Dashboard (tutti i sensori passati assieme)
         if mqtt_client and mqtt_client.is_connected():
+            fusion_meta = getattr(fsm, "last_fusion_meta", {})
+            lidar_front_m = latest_lidar_alert.get("front_distance_m") if latest_lidar_alert else None
+            point_cnt = latest_lidar_alert.get("point_count") if latest_lidar_alert else 0
+
             state_payload = {
                 "state": fsm.state.name,
                 "active_command": cmd,
                 "reason": reason,
                 "risk_level": getattr(fsm.front_risk, "held_level", "LOW"),
                 "timestamp": time.time(),
-                "fusion": getattr(fsm, "last_fusion_meta", {}),
+                "fusion": fusion_meta,
+                "ultrasonic_cm": round(float(us_cm), 1) if us_cm > 0 else None,
+                "lidar_front_m": lidar_front_m,
+                "point_count": point_cnt,
                 "slam_pose": latest_slam_pose,
             }
             mqtt_client.publish("mar/fsm/state", json.dumps(state_payload))
@@ -251,7 +269,9 @@ def main():
             if fused_imu is not None:
                 mqtt_client.publish("mar/imu/telemetry", json.dumps(fused_imu))
 
-        time.sleep(0.05)  # 20 Hz update loop
+        # Attesa reattiva: si sveglia istantaneamente se arriva un nuovo pacchetto sensore (< 1ms)
+        decision_trigger.wait(timeout=0.04)
+        decision_trigger.clear()
 
 
 if __name__ == "__main__":

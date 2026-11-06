@@ -55,6 +55,11 @@ class DecisionFSM:
         self.target_theta: float = 0.0
         self.avoidance_direction: str = "RIGHT"
         self.avoidance_start_time: float = 0.0
+        # Cooldown per evitare loop continui di saccadi visive
+        self.last_saccade_end_time: float = 0.0
+        self.saccade_cooldown_s: float = 6.0
+        # Filtro debounce allarme Time-To-Collision
+        self.ttc_alarm_count: int = 0
         # Operator / dashboard E-STOP stays latched until explicit resume
         self.operator_estop: bool = False
         # Fusione frontale ponderata (niente oscillazioni LOW↔CRITICAL)
@@ -232,17 +237,19 @@ class DecisionFSM:
                 vision_risk = str(vision_objects.get("risk_level", "") or "").upper()
 
         risk_level, dist_critica_fronte = self.front_risk.update(dist_raw_fronte, now=now)
-        # Accordo con vision: se vision tiene CRITICAL/HIGH, non sottostimare
+        # Accordo con vision: se vision tiene CRITICAL/HIGH, accelera solo se confermato da ostacolo/hazard reale
+        obs_cm = float(vision_objects.get("obstacle_near_cm", 999.0)) if vision_objects else 999.0
+        has_vis_obs = bool(vision_objects.get("obstacle_found", False)) if vision_objects else False
         if vision_risk == "CRITICAL" and risk_level != "CRITICAL":
-            # Accelera pending verso CRITICAL senza saltare il confirm interno:
-            # forza un update con distanza sotto soglia critica
-            risk_level, dist_critica_fronte = self.front_risk.update(
-                min(dist_critica_fronte, self.critical_distance_cm * 0.7), now=now
-            )
+            if obs_cm < 45.0 or has_vis_obs or has_ground_hazard:
+                risk_level, dist_critica_fronte = self.front_risk.update(
+                    min(dist_critica_fronte, self.critical_distance_cm * 0.7), now=now
+                )
         elif vision_risk == "HIGH" and risk_level in ("LOW", "MODERATE"):
-            risk_level, dist_critica_fronte = self.front_risk.update(
-                min(dist_critica_fronte, self.high_distance_cm * 0.85), now=now
-            )
+            if (obs_cm < 75.0 and has_vis_obs) or has_ground_hazard:
+                risk_level, dist_critica_fronte = self.front_risk.update(
+                    min(dist_critica_fronte, self.high_distance_cm * 0.85), now=now
+                )
 
         # 4. Gerarchia decisionale multi-livello con isteresi e persistenza delle decisioni
         MIN_HOLD_EMERGENCY_S = 2.0    # Minimo tempo di arresto prima di poter ripartire
@@ -259,13 +266,17 @@ class DecisionFSM:
             )
             return "CMD:STOP", f"[STOP ULTRASUONI] Ostacolo a {ultrasonic_distance_cm:.0f}cm"
 
-        # Livello 0b: Anticipazione predittiva per avvicinamento rapido (TTC < 1.4s)
-        if ttc < 1.4 and dist_critica_fronte < self.slow_warning_cm:
-            self.set_state(
-                RobotState.EMERGENCY_STOP,
-                f"Rischio impatto imminente (TTC: {ttc:.1f}s, Vz: {motion_vz:.0f}cm/s)",
-            )
-            return "CMD:STOP", f"[STOP IMPATTO IMMINENTE] TTC: {ttc:.1f}s (Vz: {motion_vz:.0f}cm/s)"
+        # Livello 0b: Anticipazione predittiva per avvicinamento rapido reale (TTC < 1.2s, Vz < -25 cm/s)
+        if motion_vz < -25.0 and ttc < 1.2 and dist_critica_fronte < self.slow_warning_cm:
+            self.ttc_alarm_count += 1
+            if self.ttc_alarm_count >= 2:
+                self.set_state(
+                    RobotState.EMERGENCY_STOP,
+                    f"Rischio impatto imminente confermato (TTC: {ttc:.1f}s, Vz: {motion_vz:.0f}cm/s)",
+                )
+                return "CMD:STOP", f"[STOP IMPATTO IMMINENTE] TTC: {ttc:.1f}s (Vz: {motion_vz:.0f}cm/s)"
+        else:
+            self.ttc_alarm_count = 0
 
         # Livello 1: Collisione imminente (< 30 cm) -> Scatta IMMEDIATO
         if dist_critica_fronte < self.critical_distance_cm:
@@ -315,13 +326,16 @@ class DecisionFSM:
 
         # Livello 5: Ostacolo a media distanza (< 65 cm) -> Innesco nuova deviazione attiva
         if dist_critica_fronte < self.slow_warning_cm:
-            direction = "RIGHT" if d_dx >= d_sx else "LEFT"
+            if d_dx >= 900 and d_sx >= 900:
+                direction = "RIGHT" if self.avoidance_direction != "RIGHT" else "LEFT"
+            else:
+                direction = "RIGHT" if d_dx >= d_sx else "LEFT"
             turn_cmd = "CMD:TURN_R,45" if direction == "RIGHT" else "CMD:TURN_L,45"
             self.avoidance_direction = direction
             self.set_state(RobotState.AVOIDANCE, f"Ostacolo a {dist_critica_fronte:.0f}cm -> Inizio deviazione {direction}")
             return turn_cmd, f"[DEVIAZIONE {direction}] DX:{d_dx:.0f}cm | SX:{d_sx:.0f}cm"
 
-        # Livello 6: Puntamento saccadico LiDAR (solo se in pattugliamento libero)
+        # Livello 6: Puntamento saccadico LiDAR (solo se in pattugliamento libero e cooldown trascorso)
         sector = str(lidar_alert.get("sector", "") if lidar_alert else "")
         sector_en = str(lidar_alert.get("sector_en", "") if lidar_alert else "")
         frontal_sector = sector in ("Fronte", "Front-DX", "Front-SX") or sector_en in (
@@ -333,6 +347,7 @@ class DecisionFSM:
             and lidar_alert.get("has_alert", False)
             and frontal_sector
             and abs(float(lidar_alert.get("theta", 0) or 0)) > 20
+            and (now - self.last_saccade_end_time > self.saccade_cooldown_s)
         ):
             self.target_theta = float(lidar_alert.get("theta", 0.0) or 0.0)
             self.set_state(RobotState.INSPECTING_OBJECT, f"LiDAR rileva ostacolo a θ={self.target_theta:.0f}°")
@@ -345,6 +360,7 @@ class DecisionFSM:
 
         if self.state == RobotState.INSPECTING_OBJECT:
             if now - self.state_enter_time > 1.2:
+                self.last_saccade_end_time = now
                 self.set_state(RobotState.PATROL_FORWARD, "Ispezione saccadica conclusa")
             else:
                 return "CMD:STOP", "Ispezione visiva 3D mirata"
