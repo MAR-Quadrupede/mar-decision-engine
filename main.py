@@ -27,10 +27,10 @@ IMU_CALIBRATION_TIMEOUT_S = float(os.getenv("IMU_CALIBRATION_TIMEOUT_S", "12"))
 
 fsm = DecisionFSM(
     forward_speed=50,
-    critical_distance_cm=30.0,
-    high_distance_cm=65.0,
+    critical_distance_cm=40.0,
+    high_distance_cm=70.0,
     moderate_distance_cm=120.0,
-    slow_warning_cm=65.0,
+    slow_warning_cm=70.0,
 )
 attention = AttentionController(settle_time_sec=0.4)
 imu_fusion = IMUFusion(
@@ -255,7 +255,7 @@ def main():
                 "state": fsm.state.name,
                 "active_command": cmd,
                 "reason": reason,
-                "risk_level": getattr(fsm.front_risk, "held_level", "LOW"),
+                "risk_level": getattr(fsm, "latest_risk_level", getattr(fsm.front_risk, "held_level", "LOW")),
                 "timestamp": time.time(),
                 "fusion": fusion_meta,
                 "ultrasonic_cm": round(float(us_cm), 1) if us_cm > 0 else None,

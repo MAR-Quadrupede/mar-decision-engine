@@ -85,12 +85,23 @@ class RiskDecisionStabilizer:
         raw = float(dist_cm) if dist_cm is not None else 999.0
         if raw <= 0 or raw != raw:
             raw = 999.0
+
+        # Safety Override immediato per pericolo critico (< 40cm): zero latenza
+        if raw < DIST_CRITICAL_CM:
+            self.dist_ema = raw
+            self.held_level = "CRITICAL"
+            self.pending_level = None
+            return self.held_level, float(self.dist_ema)
+
         if self.dist_ema is None:
             self.dist_ema = raw
         else:
-            a_near = min(0.75, self.ema_alpha + 0.25)
-            a_far = 0.50 if raw >= 150.0 else max(0.20, self.ema_alpha - 0.10)
-            a = a_near if raw < self.dist_ema else a_far
+            if raw < self.dist_ema:
+                # Avvicinamento rapido: priorità assoluta alla sicurezza
+                a = 0.85 if raw < DIST_HIGH_CM else 0.65
+            else:
+                # Allontanamento: isteresi graduale
+                a = 0.45 if raw >= 150.0 else max(0.20, self.ema_alpha - 0.05)
             self.dist_ema = (1.0 - a) * self.dist_ema + a * raw
 
         candidate = _candidate_level_with_hysteresis(self.dist_ema, self.held_level)
@@ -102,10 +113,15 @@ class RiskDecisionStabilizer:
         elif self.pending_level is None:
             self.pending_level = candidate
             self.pending_since = now
+            # Se scatta HIGH da LOW o MODERATE, riduci dwell a 80ms
+            needed = 0.08 if cand_i >= 2 else self.escalate_s
+            if (now - self.pending_since) >= needed:
+                self.held_level = candidate
+                self.pending_level = None
         elif cand_i > held_i:
             if _RISK_IDX.get(self.pending_level, -1) < cand_i:
                 self.pending_level = candidate
-            needed = self.escalate_s
+            needed = 0.08 if cand_i >= 2 else self.escalate_s
             if (now - self.pending_since) >= needed:
                 self.held_level = candidate
                 self.pending_level = None

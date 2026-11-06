@@ -15,10 +15,10 @@ import time
 from typing import Dict, Optional, Tuple, Any
 
 try:
-    from safety_bands import RiskDecisionStabilizer, EXIT_CRITICAL_CM, EXIT_MODERATE_CM
+    from safety_bands import RiskDecisionStabilizer, EXIT_CRITICAL_CM, EXIT_MODERATE_CM, classify_distance_cm
     from sensor_fusion import FrontRangeFusion
 except ImportError:
-    from .safety_bands import RiskDecisionStabilizer, EXIT_CRITICAL_CM, EXIT_MODERATE_CM
+    from .safety_bands import RiskDecisionStabilizer, EXIT_CRITICAL_CM, EXIT_MODERATE_CM, classify_distance_cm
     from .sensor_fusion import FrontRangeFusion
 
 
@@ -37,11 +37,11 @@ class DecisionFSM:
     def __init__(
         self,
         forward_speed: int = 50,
-        critical_distance_cm: float = 30.0,   # CRITICAL STOP immediato (< 30 cm)
-        high_distance_cm: float = 65.0,       # Deviazione / schivamento dinamico (< 65 cm)
+        critical_distance_cm: float = 40.0,   # CRITICAL STOP immediato (< 40 cm)
+        high_distance_cm: float = 70.0,       # Deviazione / schivamento dinamico (< 70 cm)
         moderate_distance_cm: float = 120.0,  # Allerta periferica (< 120 cm)
         ground_hazard_cm: float = 40.0,       # Ostacolo a terra / dislivello (< 40 cm)
-        slow_warning_cm: float = 65.0,        # Rallentamento / schivata (< 65 cm)
+        slow_warning_cm: float = 70.0,        # Rallentamento / schivata (< 70 cm)
     ):
         self.state = RobotState.IDLE
         self.forward_speed = forward_speed
@@ -53,6 +53,7 @@ class DecisionFSM:
 
         self.state_enter_time = time.time()
         self.target_theta: float = 0.0
+        self.latest_risk_level: str = "LOW"
         self.avoidance_direction: str = "RIGHT"
         self.avoidance_start_time: float = 0.0
         # Cooldown per evitare loop continui di saccadi visive
@@ -237,6 +238,19 @@ class DecisionFSM:
                 vision_risk = str(vision_objects.get("risk_level", "") or "").upper()
 
         risk_level, dist_critica_fronte = self.front_risk.update(dist_raw_fronte, now=now)
+
+        # Accordo con sensore più vicino (ponderazione garantita):
+        # Il rischio calcolato non può mai essere inferiore alla severità rilevata dal sensore frontale più prossimo
+        min_sensor_dist = float(fuse_meta.get("min_cm", min(lidar_front_cm, ultrasonic_distance_cm if ultrasonic_distance_cm > 0 else 999.0)))
+        direct_sensor_risk = classify_distance_cm(min_sensor_dist)
+        risk_hierarchy = {"LOW": 0, "MODERATE": 1, "HIGH": 2, "CRITICAL": 3}
+
+        if risk_hierarchy.get(direct_sensor_risk, 0) > risk_hierarchy.get(risk_level, 0):
+            risk_level = direct_sensor_risk
+            self.front_risk.held_level = direct_sensor_risk
+            self.front_risk.dist_ema = min(self.front_risk.dist_ema or 999.0, dist_raw_fronte)
+            dist_critica_fronte = min(dist_critica_fronte, dist_raw_fronte)
+
         # Accordo con vision: se vision tiene CRITICAL/HIGH, accelera solo se confermato da ostacolo/hazard reale
         obs_cm = float(vision_objects.get("obstacle_near_cm", 999.0)) if vision_objects else 999.0
         has_vis_obs = bool(vision_objects.get("obstacle_found", False)) if vision_objects else False
@@ -250,6 +264,8 @@ class DecisionFSM:
                 risk_level, dist_critica_fronte = self.front_risk.update(
                     min(dist_critica_fronte, self.high_distance_cm * 0.85), now=now
                 )
+
+        self.latest_risk_level = risk_level
 
         # 4. Gerarchia decisionale multi-livello con isteresi e persistenza delle decisioni
         MIN_HOLD_EMERGENCY_S = 2.0    # Minimo tempo di arresto prima di poter ripartire

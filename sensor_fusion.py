@@ -118,21 +118,28 @@ class FrontRangeFusion:
         total_weight = sum(r.weight for r in filtered_valid)
         weighted_dist = sum(r.dist_cm * r.weight for r in filtered_valid) / max(0.001, total_weight)
 
-        # Regola di sicurezza:
-        # Se un sensore rileva pericolo critico (< 30cm) o deviazione alta (< 65cm e c'è discrepanza),
-        # il sensore più vicino ha la precedenza assoluta (safety override)
-        if min_dist < 30.0:
+        # 3) Fusione a bande ponderate e ancoraggio di sicurezza (Safety Bands):
+        # - CRITICAL (< 40cm): override di collisione assoluto (min_dist)
+        # - HIGH (40cm - 70cm): ponderazione con ancoraggio rigido nella banda (< 70cm)
+        # - MODERATE (70cm - 120cm): ponderazione di cautela con ancoraggio nella banda (< 120cm)
+        # - LOW (>= 120cm): corridoio libero, equazione ponderata pura
+        if min_dist < 40.0:
             raw_fused = min_dist
             method = f"safety_override_min_{min_reading.name}"
             primary_name = min_reading.name
-        elif min_dist < 65.0:
-            # Tra 30 e 65 cm: blend prudente (65% min, 35% ponderata)
-            raw_fused = (0.65 * min_dist) + (0.35 * weighted_dist)
-            method = "conservative_weighted_blend"
+        elif min_dist < 70.0:
+            # Tra 40 e 70 cm: 80% sensore più vicino, 20% media ponderata (ancorata rigorosamente < 70cm)
+            raw_fused = (0.80 * min_dist) + (0.20 * min(weighted_dist, 69.9))
+            method = f"proximity_high_weighted_{min_reading.name}"
+            primary_name = min_reading.name
+        elif min_dist < 120.0:
+            # Tra 70 e 120 cm: 75% sensore più vicino, 25% media ponderata (ancorata rigorosamente < 120cm)
+            raw_fused = (0.75 * min_dist) + (0.25 * min(weighted_dist, 119.9))
+            method = f"proximity_moderate_weighted_{min_reading.name}"
             primary_name = min_reading.name
         else:
-            # Distanza regolare (>65cm): equazione ponderata pura
-            raw_fused = weighted_dist
+            # Distanza regolare (>120cm): equazione ponderata pura
+            raw_fused = max(120.0, weighted_dist)
             method = "full_weighted_fusion"
             primary_name = "weighted_all"
 
@@ -145,9 +152,9 @@ class FrontRangeFusion:
             raw_fused = max(15.0, raw_fused - anticipo_cm)
             method += f"_motion_anticipation_{abs(motion_vz_cms):.0f}cms"
 
-        # 3) Smoothing / Clearing:
-        # Avvicinamento -> adozione immediata della nuova distanza
-        # Allontanamento -> conferma graduale (2 frame)
+        # 4) Smoothing / Clearing:
+        # Avvicinamento (pericolo in aumento) -> adozione immediata della nuova distanza
+        # Allontanamento -> conferma graduale (2 frame) per evitare sfarfallii
         if self._held_cm is None:
             fused = raw_fused
             self._clear_confirmations = 0
@@ -160,9 +167,9 @@ class FrontRangeFusion:
                 if self._clear_confirmations >= 2:
                     fused = raw_fused
                 else:
-                    fused = (0.5 * self._held_cm) + (0.5 * raw_fused)
+                    fused = (0.35 * self._held_cm) + (0.65 * raw_fused)
             else:
-                fused = (0.40 * raw_fused) + (0.60 * self._held_cm)
+                fused = (0.30 * raw_fused) + (0.70 * self._held_cm)
 
         self._held_cm = fused
         return float(fused), {
@@ -171,6 +178,7 @@ class FrontRangeFusion:
             "inputs": inputs,
             "weighted_cm": round(weighted_dist, 1),
             "min_cm": round(min_dist, 1),
+            "closest_sensor": min_reading.name,
             "fused_cm": round(fused, 1),
             "lidar_validation": lidar_status,
         }
