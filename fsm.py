@@ -223,6 +223,16 @@ class DecisionFSM:
             self.set_state(RobotState.EMERGENCY_STOP, f"Fronte CRITICAL (d={front_cm:.0f}cm R={front_risk:.2f})", now)
             return "CMD:STOP", f"[STOP CRITICAL] fronte {front_cm:.0f}cm R={front_risk:.2f}"
 
+        # 4b) Attuatori assenti: le soglie di sicurezza sopra restano valide, ma non si
+        #     comanda marcia, fuga o sterzata. Quando l'Arduino arriva si riparte da pattuglia,
+        #     non da una manovra rimasta a metà.
+        if snap.motion_connected is False:
+            if self.state == RobotState.EMERGENCY_STOP:
+                return "CMD:STOP", "[ATTESA ATTUATORI] stop di sicurezza, motion assente"
+            if self.state not in (RobotState.PATROL_FORWARD, RobotState.IDLE):
+                self.set_state(RobotState.PATROL_FORWARD, "attuatori assenti, manovra annullata", now)
+            return "CMD:STOP", "[ATTESA ATTUATORI] controller motion non collegato"
+
         # 5) Permanenza / uscita da EMERGENCY_STOP
         if self.state == RobotState.EMERGENCY_STOP:
             t = now - self.state_enter_time

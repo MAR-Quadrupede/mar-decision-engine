@@ -82,6 +82,8 @@ class Snapshot:
     point_count: int
     degraded: bool = False  # True = solo stereo in linea (nessun LiDAR/US fresco)
     sensors_online: Dict[str, bool] = field(default_factory=dict)
+    # None = il bridge non ha ancora detto nulla; False = Arduino motion assente
+    motion_connected: Optional[bool] = None
 
     @property
     def front_reliable_cm(self) -> Optional[float]:
@@ -125,6 +127,7 @@ class Snapshot:
                 "stereo": self.stereo_fresh,
                 "imu": self.imu is not None,
                 "slam": self.pose is not None,
+                "motion": self.motion_connected is True,
             },
             "degraded": self.degraded,
             "gate_distance_cm": round(self.gate_distance_cm(), 1) if self.gate_distance_cm() < 900 else None,
@@ -162,6 +165,8 @@ class WorldModel:
         self.pose_ts: float = 0.0
         self.imu: Optional[Dict[str, Any]] = None
         self.imu_ts: float = 0.0
+        self.motion_connected: Optional[bool] = None
+        self.motion_link_ts: float = 0.0
         self._stereo_near_streak: int = 0
         # mediana corta (5 frame ≈ 0.25 s a 20 Hz) sulle colonne stereo: uccide i falsi positivi
         # di singolo frame senza aggiungere latenza percepibile
@@ -276,6 +281,12 @@ class WorldModel:
             self.ground_hazard = data
             self.ground_hazard_ts = now
             return True
+
+        if topic == "mar/hardware/status":
+            if "motion_connected" in data:
+                self.motion_connected = bool(data.get("motion_connected"))
+                self.motion_link_ts = now
+            return False
 
         if topic == "mar/slam/pose":
             self.pose = data
@@ -447,4 +458,8 @@ class WorldModel:
             degraded=degraded,
             sensors_online={"lidar": lidar_fresh, "ultrasonic": us_fresh, "stereo": stereo_fresh,
                             "imu": imu is not None, "slam": pose is not None},
+            motion_connected=(
+                None if self.motion_link_ts <= 0.0
+                else (False if (now - self.motion_link_ts) > 5.0 else self.motion_connected)
+            ),
         )

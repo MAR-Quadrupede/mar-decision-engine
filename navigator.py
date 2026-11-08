@@ -69,7 +69,10 @@ class Navigator:
         except (TypeError, ValueError):
             return
         if self._last_pose is not None:
-            self.total_motion_m += math.hypot(x - self._last_pose[0], y - self._last_pose[1])
+            step = math.hypot(x - self._last_pose[0], y - self._last_pose[1])
+            # sotto 8 mm è jitter SLAM da fermo: non deve "armare" il rilevamento incastrato
+            if step >= 0.008:
+                self.total_motion_m += step
         self._last_pose = (x, y)
         cell = (int(math.floor(x / VISIT_CELL_M)), int(math.floor(y / VISIT_CELL_M)))
         if not self.visited or (self.visited[-1][0], self.visited[-1][1]) != cell:

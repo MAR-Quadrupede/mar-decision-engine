@@ -69,6 +69,7 @@ def on_mqtt_connect(client, userdata, flags, rc, properties=None):
             ("mar/imu/telemetry", 0),
             ("mar/hardware/telemetry", 0),
             ("mar/ultrasonic/range", 0),
+            ("mar/hardware/status", 0),
             ("mar/control/motion", 0),
             ("mar/control/mode", 1),
             ("mar/safety/estop", 2),
