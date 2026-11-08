@@ -172,16 +172,10 @@ def main():
             mqtt_client = mqtt.Client(client_id="mar-decision-engine")
         mqtt_client.on_connect = on_mqtt_connect
         mqtt_client.on_message = on_mqtt_message
-        for attempt in range(1, 31):
-            try:
-                mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-                mqtt_client.loop_start()
-                break
-            except Exception as e:
-                print(f"  ⚠️ MQTT tentativo {attempt}/30 fallito ({e}); retry 2s")
-                time.sleep(2)
-        else:
-            print("  ⚠️ MQTT non raggiungibile: esecuzione standalone (nessun comando ai motori).")
+        mqtt_client.reconnect_delay_set(min_delay=1, max_delay=10)
+        mqtt_client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client.loop_start()
+        print(f"  ✓ MQTT loop avviato verso {MQTT_BROKER}:{MQTT_PORT} (retry automatico al boot)")
     else:
         print("  ⚠️ paho-mqtt non installato: esecuzione standalone.")
 

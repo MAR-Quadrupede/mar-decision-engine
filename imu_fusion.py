@@ -40,6 +40,7 @@ class IMUFusion:
         self._last_sample_ts: Optional[float] = None
         self._last_telemetry: Optional[Dict] = None
         self._lock = threading.Lock()
+        self._hotplug_gap_s = 5.0
 
     # ------------------------------------------------------------ calibration
     def _accumulate_calibration(self, gyro: np.ndarray, acc: np.ndarray):
@@ -93,11 +94,22 @@ class IMUFusion:
             self.filter.GYRO_SCALE = gyro_scale
             self.filter.ACCEL_SCALE = accel_scale
 
+            gap = None if self._last_sample_ts is None else (sample_ts - self._last_sample_ts)
+            if gap is not None and gap > self._hotplug_gap_s and self.calibrated:
+                self.calibrated = False
+                self._gyro_sum = np.zeros(3)
+                self._acc_sum = np.zeros(3)
+                self._valid_samples = 0
+                self._samples_seen = 0
+                self._calibration_deadline = time.time() + self.calibration_timeout_s
+                print(f"  ℹ️ [IMU] ricomparsa dopo {gap:.1f}s di silenzio — ricalibrazione")
+
             if not self.calibrated:
                 gyro = (gyro_raw / gyro_scale) * np.pi / 180.0
                 acc = (acc_raw / accel_scale) * self.filter.GRAVITY
                 self._samples_seen += 1
                 self._accumulate_calibration(gyro, acc)
+                self._last_sample_ts = sample_ts
                 return None
 
             # Time delta from sample timestamps (robust to MQTT jitter / dropped frames)
