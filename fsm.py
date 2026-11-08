@@ -1,393 +1,358 @@
 #!/usr/bin/env python3
 """
-M.A.R. — Finite State Machine (FSM) & Multi-Sensor Safety Engine
-Manages robot behavioral states:
-  - IDLE: robot standing or awaiting start
-  - PATROL_FORWARD: clear path forward motion (AVANTI / CMD:FORWARD)
-  - INSPECTING_OBJECT: saccadic active perception towards anomaly
-  - TERRAIN_HAZARD: low-profile ground obstacle detected by 3D vision (STOP_TERRA)
-  - AVOIDANCE: dynamic steering towards clearer side (GIRA_DX / GIRA_SX)
-  - EMERGENCY_STOP: immediate stop for critical obstacles < 30 cm (STOP)
+M.A.R. — Safety FSM & Autonomous Behaviour
+
+Stati:
+  IDLE              fermo in attesa
+  PATROL_FORWARD    marcia autonoma con velocità adattiva
+  INSPECTING_OBJECT saccade: rotazione verso un'anomalia LiDAR laterale per inquadrarla
+  AVOIDANCE         sterzata verso il settore migliore scelto dal Navigator
+  ESCAPE            retromarcia controllata quando il fronte è bloccato / robot incastrato
+  TERRAIN_HAZARD    dislivello / ostacolo basso a terra (stereo) → STOP_TERRA
+  EMERGENCY_STOP    arresto: sensore affidabile < 40 cm, inclinazione critica, TTC, E-Stop operatore
+
+Tutte le soglie di distanza provengono da safety_bands (40 / 70 / 120 cm) e sono le stesse
+usate da mar-vision-service e dalla dashboard. L'ingresso è uno `Snapshot` del WorldModel,
+quindi la FSM è deterministica e testabile iniettando `now`.
 """
 
-from enum import Enum, auto
-import time
-from typing import Dict, Optional, Tuple, Any
+from __future__ import annotations
 
-try:
-    from safety_bands import RiskDecisionStabilizer, EXIT_CRITICAL_CM, EXIT_MODERATE_CM, classify_distance_cm
-    from sensor_fusion import FrontRangeFusion
-except ImportError:
-    from .safety_bands import RiskDecisionStabilizer, EXIT_CRITICAL_CM, EXIT_MODERATE_CM, classify_distance_cm
-    from .sensor_fusion import FrontRangeFusion
+import os
+import time
+from enum import Enum, auto
+from typing import Any, Dict, Optional, Tuple
+
+from safety_bands import RiskDecisionStabilizer, classify_distance_cm, DIST_CRITICAL_CM, DIST_HIGH_CM, DIST_MODERATE_CM
+from risk_model import RISK_CRITICAL, RISK_HIGH, RISK_MODERATE, risk_to_level
+from navigator import Navigator, turn_command_for_angle
+from world_model import Snapshot
 
 
 class RobotState(Enum):
     IDLE = auto()
     PATROL_FORWARD = auto()
     INSPECTING_OBJECT = auto()
-    TERRAIN_HAZARD = auto()
     AVOIDANCE = auto()
+    ESCAPE = auto()
+    TERRAIN_HAZARD = auto()
     EMERGENCY_STOP = auto()
 
 
-class DecisionFSM:
-    """Deterministic multi-layer behavioral state machine for M.A.R. quadrupede."""
+_RISK_ORDER = {"LOW": 0, "MODERATE": 1, "HIGH": 2, "CRITICAL": 3}
 
+
+class DecisionFSM:
     def __init__(
         self,
         forward_speed: int = 50,
-        critical_distance_cm: float = 40.0,   # CRITICAL STOP immediato (< 40 cm)
-        high_distance_cm: float = 70.0,       # Deviazione / schivamento dinamico (< 70 cm)
-        moderate_distance_cm: float = 120.0,  # Allerta periferica (< 120 cm)
-        ground_hazard_cm: float = 40.0,       # Ostacolo a terra / dislivello (< 40 cm)
-        slow_warning_cm: float = 70.0,        # Rallentamento / schivata (< 70 cm)
+        slow_speed: int = 25,
+        critical_distance_cm: float = DIST_CRITICAL_CM,
+        high_distance_cm: float = DIST_HIGH_CM,
+        moderate_distance_cm: float = DIST_MODERATE_CM,
+        ground_hazard_cm: float = 40.0,
+        tilt_limit_deg: float = 40.0,
+        autonomous: bool = True,
     ):
         self.state = RobotState.IDLE
-        self.forward_speed = forward_speed
-        self.critical_distance_cm = critical_distance_cm
-        self.high_distance_cm = high_distance_cm
-        self.moderate_distance_cm = moderate_distance_cm
-        self.ground_hazard_cm = ground_hazard_cm
-        self.slow_warning_cm = slow_warning_cm
+        self.forward_speed = int(forward_speed)
+        self.slow_speed = int(slow_speed)
+        self.critical_distance_cm = float(critical_distance_cm)
+        self.high_distance_cm = float(high_distance_cm)
+        self.moderate_distance_cm = float(moderate_distance_cm)
+        self.ground_hazard_cm = float(ground_hazard_cm)
+        self.tilt_limit_deg = float(tilt_limit_deg)
+        self.autonomous = bool(autonomous)
 
         self.state_enter_time = time.time()
-        self.target_theta: float = 0.0
-        self.latest_risk_level: str = "LOW"
-        self.avoidance_direction: str = "RIGHT"
-        self.avoidance_start_time: float = 0.0
-        # Cooldown per evitare loop continui di saccadi visive
-        self.last_saccade_end_time: float = 0.0
-        self.saccade_cooldown_s: float = 6.0
-        # Filtro debounce allarme Time-To-Collision
-        self.ttc_alarm_count: int = 0
-        # Operator / dashboard E-STOP stays latched until explicit resume
-        self.operator_estop: bool = False
-        # Fusione frontale ponderata (niente oscillazioni LOW↔CRITICAL)
-        self.front_risk = RiskDecisionStabilizer(ema_alpha=0.25, escalate_s=0.35, deescalate_s=2.0)
-        # Layered fusion stile Nav2 (US Range + LiDAR Obstacle + stereo corroboration)
-        self.range_fusion = FrontRangeFusion(agree_ratio=0.35)
-        self.last_fusion_meta: Dict[str, Any] = {}
+        self.operator_estop = False
+        self.target_theta = 0.0
+        self.avoidance_sector: Optional[str] = None
+        self.avoidance_cmd = "CMD:STOP"
+        self.last_saccade_end_time = 0.0
+        self.saccade_cooldown_s = 6.0
+        self.ttc_alarm_count = 0
+        self.escape_reason = ""
 
-    def set_state(self, new_state: RobotState, reason: str = ""):
+        self.navigator = Navigator()
+        # Stabilizzatore sulla DISTANZA frontale fusa (isteresi 40/52, 70/85, 120/140)
+        self.front_stabilizer = RiskDecisionStabilizer(
+            ema_alpha=float(os.getenv("MAR_RISK_EMA_ALPHA", "0.30")),
+            escalate_s=float(os.getenv("MAR_RISK_ESCALATE_S", "0.20")),
+            deescalate_s=float(os.getenv("MAR_RISK_DEESCALATE_S", "1.2")),
+        )
+        # EMA asimmetrica sul RISCHIO frontale (sale subito, scende con calma)
+        self.front_risk_ema: Optional[float] = None
+        self.latest_risk_level = "LOW"
+        self.latest_risk_value = 0.0
+        self.last_decision: Dict[str, Any] = {}
+
+        # Tempi minimi di permanenza (s)
+        self.MIN_HOLD_EMERGENCY_S = 1.5
+        self.MIN_HOLD_AVOIDANCE_S = 1.2
+        self.MIN_HOLD_ESCAPE_S = 1.5
+        self.MAX_ESCAPE_S = 3.0
+        self.MIN_HOLD_TERRAIN_S = 1.5
+        self.EXIT_CRITICAL_CM = self.critical_distance_cm + 15.0   # 55
+        self.EXIT_AVOIDANCE_CM = self.high_distance_cm + 10.0      # 80
+
+    # ---------------------------------------------------------------- helpers
+    def set_state(self, new_state: RobotState, reason: str = "", now: Optional[float] = None):
         if self.state != new_state:
-            print(f"🔄 [FSM STATE CHANGE]: {self.state.name} ➔ {new_state.name} | Motivo: {reason}")
+            print(f"🔄 [FSM] {self.state.name} ➔ {new_state.name} | {reason}")
             self.state = new_state
-            self.state_enter_time = time.time()
+            self.state_enter_time = time.time() if now is None else now
 
     def trigger_operator_estop(self, reason: str = "E-Stop operatore"):
-        """Latch emergency stop from dashboard / safety topic (does not auto-clear)."""
         self.operator_estop = True
         self.set_state(RobotState.EMERGENCY_STOP, reason)
 
     def clear_operator_estop(self, reason: str = "Resume operatore"):
-        """Release latched operator E-STOP and return to patrol when path allows."""
         self.operator_estop = False
         if self.state == RobotState.EMERGENCY_STOP:
-            self.set_state(RobotState.PATROL_FORWARD, reason)
+            self.set_state(RobotState.PATROL_FORWARD if self.autonomous else RobotState.IDLE, reason)
 
-    def update(
-        self,
-        lidar_alert: Optional[Dict],
-        vision_objects: Optional[Dict],
-        ultrasonic_distance_cm: float = -1.0,
-        ground_hazard_alert: Optional[Dict] = None,
-        imu_data: Optional[Dict] = None,
-        motion_data: Optional[Dict] = None
-    ) -> Tuple[str, str]:
-        """
-        Processes multi-sensor inputs (LiDAR 360°, Stereo 3D Vision, IMU Kalman, Ultrasonic)
-        and produces the next deterministic motion command.
-        Returns: (CMD_STRING, REASON_DESCRIPTION)
-        """
-        now = time.time()
+    def set_autonomous(self, enabled: bool, reason: str = ""):
+        self.autonomous = bool(enabled)
+        if not enabled and self.state not in (RobotState.EMERGENCY_STOP,):
+            self.set_state(RobotState.IDLE, reason or "Autonomia disattivata")
+        elif enabled and self.state == RobotState.IDLE and not self.operator_estop:
+            self.set_state(RobotState.PATROL_FORWARD, reason or "Autonomia attivata")
 
-        # Latched operator E-STOP: motors stay frozen until clear_operator_estop()
+    def _stabilized_risk(self, snap: Snapshot) -> Tuple[str, float, float]:
+        """Ritorna (livello, distanza frontale stabilizzata, rischio frontale filtrato)."""
+        _, _, dist_level, dist_smoothed = self.front_stabilizer.update(
+            snap.gate_distance_cm(),
+            fov_blocked=snap.fov_blocked,
+            safety_alarm=snap.vision_safety_alarm,
+            safety_reason="allarme lenti stereocamera",
+            now=snap.now,
+        )
+        r = float(snap.front_risk)
+        if self.front_risk_ema is None:
+            self.front_risk_ema = r
+        else:
+            a = 0.70 if r > self.front_risk_ema else 0.20
+            self.front_risk_ema = (1.0 - a) * self.front_risk_ema + a * r
+        risk_level = risk_to_level(self.front_risk_ema)
+        # Il livello finale è il più severo tra distanza stabilizzata e rischio fuso
+        level = dist_level if _RISK_ORDER[dist_level] >= _RISK_ORDER[risk_level] else risk_level
+        # Il settore Fronte con sensori AFFIDABILI vicini impone subito il suo livello (zero latenza)
+        f = snap.sector_risks.get("Fronte")
+        if f and f.min_reliable_cm is not None:
+            direct = classify_distance_cm(f.min_reliable_cm)
+            if _RISK_ORDER[direct] > _RISK_ORDER[level]:
+                level = direct
+        return level, float(dist_smoothed), float(self.front_risk_ema)
+
+    # ------------------------------------------------------------------ update
+    def update(self, snap: Snapshot) -> Tuple[str, str]:
+        now = snap.now
+        self.navigator.note_pose(snap.pose, now)
+
+        risk_level, front_cm, front_risk = self._stabilized_risk(snap)
+        self.latest_risk_level = risk_level
+        self.latest_risk_value = front_risk
+
+        cmd, reason = self._decide(snap, risk_level, front_cm, front_risk, now)
+
+        if cmd.startswith("CMD:FORWARD"):
+            self.navigator.on_forward(snap, now)
+        else:
+            self.navigator.on_not_forward()
+
+        self.last_decision = {
+            "cmd": cmd, "reason": reason, "state": self.state.name,
+            "risk_level": risk_level, "front_risk": round(front_risk, 3), "front_cm": round(front_cm, 1),
+            "nav_choice": self.navigator.last_choice,
+            "nav_scores": {k: round(v, 3) for k, v in self.navigator.last_scores.items()},
+        }
+        return cmd, reason
+
+    # ------------------------------------------------------------------ core
+    def _decide(self, snap: Snapshot, risk_level: str, front_cm: float, front_risk: float, now: float) -> Tuple[str, str]:
+        # 0) E-STOP operatore latched
         if self.operator_estop:
-            if self.state != RobotState.EMERGENCY_STOP:
-                self.set_state(RobotState.EMERGENCY_STOP, "E-Stop operatore latched")
+            self.set_state(RobotState.EMERGENCY_STOP, "E-Stop operatore latched", now)
             return "CMD:STOP", "[E-STOP OPERATORE] In attesa di resume"
 
-        # 0. Analisi Assetto e Sicurezza IMU (Rollio e Beccheggio)
-        roll_robot = 0.0
-        pitch_robot = 0.0
-        if imu_data:
-            t_imu = imu_data.get("timestamp", now)
-            if now - t_imu < 1.0:
-                roll_robot = float(imu_data.get("roll", 0.0))
-                pitch_robot = float(imu_data.get("pitch", 0.0))
+        # 1) Inclinazione critica (IMU)
+        roll = pitch = 0.0
+        if snap.imu:
+            try:
+                roll = float(snap.imu.get("roll", 0.0))
+                pitch = float(snap.imu.get("pitch", 0.0))
+            except (TypeError, ValueError):
+                roll = pitch = 0.0
+        if abs(roll) > self.tilt_limit_deg or abs(pitch) > self.tilt_limit_deg:
+            self.set_state(RobotState.EMERGENCY_STOP, f"Inclinazione critica roll={roll:.0f}° pitch={pitch:.0f}°", now)
+            return "CMD:STOP", f"[STOP INCLINAZIONE] roll={roll:.1f}° pitch={pitch:.1f}°"
 
-        if abs(roll_robot) > 40.0 or abs(pitch_robot) > 40.0:
-            if self.state != RobotState.EMERGENCY_STOP:
-                self.set_state(RobotState.EMERGENCY_STOP, f"Inclinazione critica (Roll:{roll_robot:.1f}°, Pitch:{pitch_robot:.1f}°)")
-            return "CMD:STOP", f"[STOP INCLINAZIONE CRITICA] Roll:{roll_robot:.1f}° Pitch:{pitch_robot:.1f}°"
+        if not self.autonomous:
+            self.set_state(RobotState.IDLE, "Modalità manuale/idle", now)
+            return "CMD:STOP", "[IDLE] Autonomia disattivata"
 
-        # 1. Estrazione metriche LiDAR (Fronte, DX, SX)
-        lidar_front_cm = 999.0
-        d_dx = 999.0
-        d_sx = 999.0
+        # 2) Sensore AFFIDABILE (US / LiDAR) sotto soglia critica nel fronte → STOP immediato
+        f = snap.sector_risks.get("Fronte")
+        min_rel = f.min_reliable_cm if f else None
+        if min_rel is not None and min_rel < self.critical_distance_cm:
+            src = min(((v, k) for k, v in (f.inputs or {}).items() if k != "stereo"), default=(min_rel, "lidar/us"))[1]
+            self.set_state(RobotState.EMERGENCY_STOP, f"Ostacolo critico {src} a {min_rel:.0f}cm", now)
+            return "CMD:STOP", f"[STOP {src.upper()}] ostacolo a {min_rel:.0f}cm (< {self.critical_distance_cm:.0f})"
 
-        if lidar_alert:
-            t_lidar = lidar_alert.get("timestamp", now)
-            if now - t_lidar < 1.0:
-                sec_mins = lidar_alert.get("sector_mins", {})
-                if not sec_mins and "sector_mins_en" in lidar_alert:
-                    sec_mins = lidar_alert.get("sector_mins_en", {})
+        # 2b) Diagonali frontali critiche (il corpo li lambisce)
+        for k in ("Front-SX", "Front-DX"):
+            s = snap.sector_risks.get(k)
+            if s and s.min_reliable_cm is not None and s.min_reliable_cm < self.critical_distance_cm * 0.8:
+                self.set_state(RobotState.EMERGENCY_STOP, f"Ostacolo critico {k} a {s.min_reliable_cm:.0f}cm", now)
+                return "CMD:STOP", f"[STOP {k}] ostacolo a {s.min_reliable_cm:.0f}cm"
 
-                # Distanza frontale da LiDAR
-                f_m = lidar_alert.get("front_distance_m")
-                if f_m is not None:
-                    lidar_front_cm = float(f_m) * 100.0 if float(f_m) < 15.0 else float(f_m)
-                elif lidar_alert.get("sector") in ("Fronte", "FRONT") and lidar_alert.get("dist_m") is not None:
-                    dist_val = float(lidar_alert["dist_m"])
-                    lidar_front_cm = dist_val * 100.0 if dist_val < 15.0 else dist_val
-                elif sec_mins.get("Fronte") is not None or sec_mins.get("FRONT") is not None:
-                    val_f = sec_mins.get("Fronte") if sec_mins.get("Fronte") is not None else sec_mins.get("FRONT")
-                    lidar_front_cm = float(val_f) * 100.0 if float(val_f) < 15.0 else float(val_f)
-
-                # Se un ostacolo imminente (< 30cm) invade i settori angolari frontali (Front-DX o Front-SX)
-                for adj_key in ("Front-DX", "FRONT_RIGHT", "Front-SX", "FRONT_LEFT"):
-                    if sec_mins.get(adj_key) is not None:
-                        val_adj = float(sec_mins[adj_key])
-                        cm_adj = val_adj * 100.0 if val_adj < 15.0 else val_adj
-                        if cm_adj < self.critical_distance_cm:
-                            lidar_front_cm = min(lidar_front_cm, cm_adj)
-
-                # Spazi laterali per deviazione (Destra vs Sinistra)
-                val_dx = (
-                    sec_mins.get("Destra") if sec_mins.get("Destra") is not None else
-                    sec_mins.get("Front-DX") if sec_mins.get("Front-DX") is not None else
-                    sec_mins.get("RIGHT") if sec_mins.get("RIGHT") is not None else
-                    sec_mins.get("FRONT_RIGHT")
-                )
-                val_sx = (
-                    sec_mins.get("Sinistra") if sec_mins.get("Sinistra") is not None else
-                    sec_mins.get("Front-SX") if sec_mins.get("Front-SX") is not None else
-                    sec_mins.get("LEFT") if sec_mins.get("LEFT") is not None else
-                    sec_mins.get("FRONT_LEFT")
-                )
-
-                if val_dx is not None:
-                    d_dx = float(val_dx) * 100.0 if float(val_dx) < 15.0 else float(val_dx)
-                if val_sx is not None:
-                    d_sx = float(val_sx) * 100.0 if float(val_sx) < 15.0 else float(val_sx)
-
-        # 2. Estrazione metriche Visione 3D (Z_basso, Z_centro, Z_alto)
-        z_basso_cm = 999.0
-        z_centro_cm = 999.0
-        has_ground_hazard = False
-
-        if vision_objects:
-            t_vision = vision_objects.get("timestamp", now)
-            if now - t_vision < 1.0:
-                grid_3d = vision_objects.get("spatial_grid_3d", {})
-                if "Basso_Centro" in grid_3d:
-                    z_basso_cm = float(grid_3d["Basso_Centro"][2])
-                elif "z_basso_cm" in vision_objects:
-                    z_basso_cm = float(vision_objects["z_basso_cm"])
-
-                if "Centro_Centro" in grid_3d:
-                    z_centro_cm = float(grid_3d["Centro_Centro"][2])
-                elif "z_centro_cm" in vision_objects:
-                    z_centro_cm = float(vision_objects["z_centro_cm"])
-
-                has_ground_hazard = bool(vision_objects.get("ground_hazard", False)) or (z_basso_cm < self.ground_hazard_cm)
-
-        if ground_hazard_alert:
-            t_hazard = ground_hazard_alert.get("timestamp", now)
-            if now - t_hazard < 1.0:
-                has_ground_hazard = True
-                if "z_basso_cm" in ground_hazard_alert:
-                    z_basso_cm = min(z_basso_cm, float(ground_hazard_alert["z_basso_cm"]))
-
-        # 3. Fusione frontale: LiDAR + stereo (target/z) + ultrasuoni
-        vision_target_cm = 999.0
-        if vision_objects:
-            t_vision2 = vision_objects.get("timestamp", now)
-            if now - t_vision2 < 1.0:
-                for key in ("target_dist_cm", "obstacle_near_cm"):
-                    if vision_objects.get(key) is not None:
-                        try:
-                            vision_target_cm = min(vision_target_cm, float(vision_objects[key]))
-                        except Exception:
-                            pass
-                # risk_level CRITICAL from vision (FOV blocked / sheet) forces stop distance
-                if str(vision_objects.get("risk_level", "")).upper() == "CRITICAL":
-                    vision_target_cm = min(vision_target_cm, self.critical_distance_cm * 0.8)
-
-        # Fusione layered ponderata con safety override
-        stereo_for_fuse = vision_target_cm if vision_target_cm < 900.0 else (
-            z_centro_cm if z_centro_cm < 900.0 else 999.0
-        )
-        motion_vz = float(motion_data.get("velocity_z_cms", 0.0)) if motion_data else 0.0
-        ttc = float(motion_data.get("ttc_sec", 999.0)) if motion_data else 999.0
-
-        dist_raw_fronte, fuse_meta = self.range_fusion.fuse(
-            ultrasonic_cm=float(ultrasonic_distance_cm),
-            lidar_front_cm=float(lidar_front_cm),
-            stereo_cm=float(stereo_for_fuse),
-            motion_vz_cms=motion_vz,
-        )
-        self.last_fusion_meta = fuse_meta
-
-        # Preferisci risk già stabilizzato dalla vision se fresco e più severo
-        vision_risk = ""
-        if vision_objects:
-            t_vr = vision_objects.get("timestamp", now)
-            if now - t_vr < 1.0:
-                vision_risk = str(vision_objects.get("risk_level", "") or "").upper()
-
-        risk_level, dist_critica_fronte = self.front_risk.update(dist_raw_fronte, now=now)
-
-        # Accordo con sensore più vicino (ponderazione garantita):
-        # Il rischio calcolato non può mai essere inferiore alla severità rilevata dal sensore frontale più prossimo
-        min_sensor_dist = float(fuse_meta.get("min_cm", min(lidar_front_cm, ultrasonic_distance_cm if ultrasonic_distance_cm > 0 else 999.0)))
-        direct_sensor_risk = classify_distance_cm(min_sensor_dist)
-        risk_hierarchy = {"LOW": 0, "MODERATE": 1, "HIGH": 2, "CRITICAL": 3}
-
-        if risk_hierarchy.get(direct_sensor_risk, 0) > risk_hierarchy.get(risk_level, 0):
-            risk_level = direct_sensor_risk
-            self.front_risk.held_level = direct_sensor_risk
-            self.front_risk.dist_ema = min(self.front_risk.dist_ema or 999.0, dist_raw_fronte)
-            dist_critica_fronte = min(dist_critica_fronte, dist_raw_fronte)
-
-        # Accordo con vision: se vision tiene CRITICAL/HIGH, accelera solo se confermato da ostacolo/hazard reale
-        obs_cm = float(vision_objects.get("obstacle_near_cm", 999.0)) if vision_objects else 999.0
-        has_vis_obs = bool(vision_objects.get("obstacle_found", False)) if vision_objects else False
-        if vision_risk == "CRITICAL" and risk_level != "CRITICAL":
-            if obs_cm < 45.0 or has_vis_obs or has_ground_hazard:
-                risk_level, dist_critica_fronte = self.front_risk.update(
-                    min(dist_critica_fronte, self.critical_distance_cm * 0.7), now=now
-                )
-        elif vision_risk == "HIGH" and risk_level in ("LOW", "MODERATE"):
-            if (obs_cm < 75.0 and has_vis_obs) or has_ground_hazard:
-                risk_level, dist_critica_fronte = self.front_risk.update(
-                    min(dist_critica_fronte, self.high_distance_cm * 0.85), now=now
-                )
-
-        self.latest_risk_level = risk_level
-
-        # 4. Gerarchia decisionale multi-livello con isteresi e persistenza delle decisioni
-        MIN_HOLD_EMERGENCY_S = 2.0    # Minimo tempo di arresto prima di poter ripartire
-        MIN_HOLD_AVOIDANCE_S = 2.0    # Minimo tempo per completare una manovra di sterzata
-        MIN_HOLD_TERRAIN_S = 1.5      # Minimo tempo di stop per ostacolo a terra
-        EXIT_CRITICAL_DIST_CM = 55.0  # Isteresi uscita da stop: deve vedere almeno 55cm liberi
-        EXIT_AVOIDANCE_DIST_CM = 75.0 # Isteresi uscita da deviazione: deve vedere almeno 75cm liberi
-
-        # Livello 0: Sicurezza Assoluta Ultrasuoni Diretto (< 30 cm)
-        if 0.0 < ultrasonic_distance_cm < self.critical_distance_cm:
-            self.set_state(
-                RobotState.EMERGENCY_STOP,
-                f"Ostacolo critico ultrasuoni ({ultrasonic_distance_cm:.0f}cm < {self.critical_distance_cm:.0f}cm)",
-            )
-            return "CMD:STOP", f"[STOP ULTRASUONI] Ostacolo a {ultrasonic_distance_cm:.0f}cm"
-
-        # Livello 0b: Anticipazione predittiva per avvicinamento rapido reale (TTC < 1.2s, Vz < -25 cm/s)
-        if motion_vz < -25.0 and ttc < 1.2 and dist_critica_fronte < self.slow_warning_cm:
+        # 3) Time-To-Collision (stereo motion tracker) — richiede 2 conferme
+        vz = float(snap.motion.get("velocity_z_cms", 0.0) or 0.0)
+        ttc = float(snap.motion.get("ttc_sec", 999.0) or 999.0)
+        if vz < -25.0 and ttc < 1.2 and min(front_cm, snap.front_dist_cm) < self.high_distance_cm:
             self.ttc_alarm_count += 1
             if self.ttc_alarm_count >= 2:
-                self.set_state(
-                    RobotState.EMERGENCY_STOP,
-                    f"Rischio impatto imminente confermato (TTC: {ttc:.1f}s, Vz: {motion_vz:.0f}cm/s)",
-                )
-                return "CMD:STOP", f"[STOP IMPATTO IMMINENTE] TTC: {ttc:.1f}s (Vz: {motion_vz:.0f}cm/s)"
+                self.set_state(RobotState.EMERGENCY_STOP, f"Impatto imminente TTC={ttc:.1f}s", now)
+                return "CMD:STOP", f"[STOP TTC] {ttc:.1f}s (vz={vz:.0f}cm/s)"
         else:
             self.ttc_alarm_count = 0
 
-        # Livello 1: Collisione imminente (< 30 cm) -> Scatta IMMEDIATO
-        if dist_critica_fronte < self.critical_distance_cm:
-            self.set_state(
-                RobotState.EMERGENCY_STOP,
-                f"Ostacolo critico frontale ({dist_critica_fronte:.0f}cm < {self.critical_distance_cm:.0f}cm)",
-            )
-            return "CMD:STOP", f"[STOP EMERGENCY] Ostacolo a {dist_critica_fronte:.0f}cm"
+        # 4) Rischio/distanza frontale CRITICAL (fusione) → STOP
+        if risk_level == "CRITICAL" or front_cm < self.critical_distance_cm:
+            self.set_state(RobotState.EMERGENCY_STOP, f"Fronte CRITICAL (d={front_cm:.0f}cm R={front_risk:.2f})", now)
+            return "CMD:STOP", f"[STOP CRITICAL] fronte {front_cm:.0f}cm R={front_risk:.2f}"
 
-        # Livello 2: Se siamo attualmente in EMERGENCY_STOP, mantieni l'arresto (hold time + isteresi)
+        # 5) Permanenza / uscita da EMERGENCY_STOP
         if self.state == RobotState.EMERGENCY_STOP:
-            time_in_stop = now - self.state_enter_time
-            if self.operator_estop:
-                return "CMD:STOP", "[E-STOP OPERATORE BLOCCATO]"
-            if time_in_stop < MIN_HOLD_EMERGENCY_S:
-                return "CMD:STOP", f"[HOLD EMERGENCY STOP] {time_in_stop:.1f}s/{MIN_HOLD_EMERGENCY_S:.1f}s (fronte={dist_critica_fronte:.0f}cm)"
-            # Hold time trascorso: per uscire, la strada deve essere chiaramente libera
-            if dist_critica_fronte >= EXIT_CRITICAL_DIST_CM and not has_ground_hazard:
-                self.set_state(RobotState.PATROL_FORWARD, f"Via libera confermata (fronte={dist_critica_fronte:.0f}cm)")
+            t = now - self.state_enter_time
+            if t < self.MIN_HOLD_EMERGENCY_S:
+                return "CMD:STOP", f"[HOLD STOP] {t:.1f}/{self.MIN_HOLD_EMERGENCY_S:.1f}s fronte={front_cm:.0f}cm"
+            if front_cm >= self.EXIT_CRITICAL_CM and not snap.ground_hazard and front_risk < RISK_HIGH:
+                self.set_state(RobotState.PATROL_FORWARD, f"Via libera (fronte={front_cm:.0f}cm)", now)
             else:
-                return "CMD:STOP", f"[ATTESA VIA LIBERA] fronte={dist_critica_fronte:.0f}cm < {EXIT_CRITICAL_DIST_CM:.0f}cm"
+                # fermi da un po' con il fronte ancora chiuso: prova una via di fuga
+                if t > 4.0 and self.navigator.escape_possible(snap):
+                    self.escape_reason = "fronte bloccato dopo stop"
+                    self.set_state(RobotState.ESCAPE, self.escape_reason, now)
+                    return "CMD:BACKWARD,30", f"[ESCAPE] {self.escape_reason}"
+                return "CMD:STOP", f"[ATTESA VIA LIBERA] fronte={front_cm:.0f}cm (< {self.EXIT_CRITICAL_CM:.0f})"
 
-        # Livello 3: Dislivello / gradino a terra (< 40 cm)
-        if has_ground_hazard and (z_basso_cm < self.ground_hazard_cm):
-            self.set_state(RobotState.TERRAIN_HAZARD, f"Dislivello a terra (Z_basso={z_basso_cm:.0f} cm)")
-            return "CMD:STOP_TERRA", f"[OSTACOLO A TERRA] Z_basso: {z_basso_cm:.0f}cm"
-
+        # 6) Dislivello / ostacolo a terra
+        if snap.ground_hazard and snap.z_basso_cm < self.ground_hazard_cm:
+            self.set_state(RobotState.TERRAIN_HAZARD, f"Ostacolo a terra Z_basso={snap.z_basso_cm:.0f}cm", now)
+            return "CMD:STOP_TERRA", f"[OSTACOLO A TERRA] Z_basso={snap.z_basso_cm:.0f}cm"
         if self.state == RobotState.TERRAIN_HAZARD:
-            time_in_th = now - self.state_enter_time
-            if time_in_th < MIN_HOLD_TERRAIN_S or has_ground_hazard or z_basso_cm < 48.0:
-                return "CMD:STOP_TERRA", f"[HOLD TERRAIN HAZARD] Z_basso={z_basso_cm:.0f}cm"
-            self.set_state(RobotState.PATROL_FORWARD, "Terreno libero")
+            t = now - self.state_enter_time
+            if t < self.MIN_HOLD_TERRAIN_S or snap.ground_hazard or snap.z_basso_cm < self.ground_hazard_cm + 8.0:
+                return "CMD:STOP_TERRA", f"[HOLD TERRAIN] Z_basso={snap.z_basso_cm:.0f}cm"
+            self.set_state(RobotState.PATROL_FORWARD, "Terreno libero", now)
 
-        # Livello 4: Se siamo in AVOIDANCE (deviazione in corso), PORTA AVANTI LA DECISIONE!
+        # 7) ESCAPE in corso (retromarcia) → poi scegli una nuova direzione
+        if self.state == RobotState.ESCAPE:
+            t = now - self.state_enter_time
+            rear_cm = snap.sector_dist("Retro", default=999.0)
+            if rear_cm < self.critical_distance_cm + 10.0:
+                self.set_state(RobotState.EMERGENCY_STOP, f"Retro bloccato ({rear_cm:.0f}cm)", now)
+                return "CMD:STOP", f"[STOP RETRO] {rear_cm:.0f}cm"
+            if t < self.MIN_HOLD_ESCAPE_S or (t < self.MAX_ESCAPE_S and front_cm < self.EXIT_AVOIDANCE_CM):
+                return "CMD:BACKWARD,30", f"[ESCAPE] {self.escape_reason} ({t:.1f}s)"
+            sector, ang = self.navigator.choose_heading(snap, now)
+            if sector is None:
+                self.set_state(RobotState.EMERGENCY_STOP, "Nessuna via di fuga", now)
+                return "CMD:STOP", "[STOP] nessun settore percorribile"
+            self.avoidance_sector, self.avoidance_cmd = sector, turn_command_for_angle(ang)
+            self.set_state(RobotState.AVOIDANCE, f"Dopo escape → {sector}", now)
+            return self.avoidance_cmd, f"[DEVIAZIONE {sector}] dopo retromarcia"
+
+        # 8) AVOIDANCE in corso: completa la sterzata, poi riparti quando il fronte è libero
         if self.state == RobotState.AVOIDANCE:
-            time_in_avoid = now - self.state_enter_time
-            turn_cmd = "CMD:TURN_R,45" if self.avoidance_direction == "RIGHT" else "CMD:TURN_L,45"
-            # Deve mantenere la sterzata per almeno MIN_HOLD_AVOIDANCE_S
-            if time_in_avoid < MIN_HOLD_AVOIDANCE_S:
-                return turn_cmd, f"[CONTINUA DEVIAZIONE {self.avoidance_direction}] {time_in_avoid:.1f}s/{MIN_HOLD_AVOIDANCE_S:.1f}s"
-            # Se il tempo minimo è passato ed il fronte è ora libero
-            if dist_critica_fronte >= EXIT_AVOIDANCE_DIST_CM:
-                self.set_state(RobotState.PATROL_FORWARD, f"Deviazione conclusa con successo (fronte={dist_critica_fronte:.0f}cm)")
+            t = now - self.state_enter_time
+            if t < self.MIN_HOLD_AVOIDANCE_S:
+                return self.avoidance_cmd, f"[DEVIAZIONE {self.avoidance_sector}] {t:.1f}/{self.MIN_HOLD_AVOIDANCE_S:.1f}s"
+            if front_cm >= self.EXIT_AVOIDANCE_CM and front_risk < RISK_MODERATE + 0.15:
+                self.set_state(RobotState.PATROL_FORWARD, f"Deviazione completata (fronte={front_cm:.0f}cm)", now)
+            elif t > 6.0:
+                # sterzo da troppo senza aprire il fronte: ricalcola
+                sector, ang = self.navigator.choose_heading(snap, now)
+                if sector is None and self.navigator.escape_possible(snap):
+                    self.escape_reason = "deviazione inefficace"
+                    self.set_state(RobotState.ESCAPE, self.escape_reason, now)
+                    return "CMD:BACKWARD,30", f"[ESCAPE] {self.escape_reason}"
+                if sector is not None:
+                    self.avoidance_sector, self.avoidance_cmd = sector, turn_command_for_angle(ang)
+                    self.state_enter_time = now
+                return self.avoidance_cmd, f"[DEVIAZIONE {self.avoidance_sector}] ricalcolo"
             else:
-                # Fronte ancora occupato, continua la manovra
-                return turn_cmd, f"[MANOVRA CONTINUA {self.avoidance_direction}] fronte={dist_critica_fronte:.0f}cm"
+                return self.avoidance_cmd, f"[DEVIAZIONE {self.avoidance_sector}] fronte={front_cm:.0f}cm"
 
-        # Livello 5: Ostacolo a media distanza (< 65 cm) -> Innesco nuova deviazione attiva
-        if dist_critica_fronte < self.slow_warning_cm:
-            if d_dx >= 900 and d_sx >= 900:
-                direction = "RIGHT" if self.avoidance_direction != "RIGHT" else "LEFT"
-            else:
-                direction = "RIGHT" if d_dx >= d_sx else "LEFT"
-            turn_cmd = "CMD:TURN_R,45" if direction == "RIGHT" else "CMD:TURN_L,45"
-            self.avoidance_direction = direction
-            self.set_state(RobotState.AVOIDANCE, f"Ostacolo a {dist_critica_fronte:.0f}cm -> Inizio deviazione {direction}")
-            return turn_cmd, f"[DEVIAZIONE {direction}] DX:{d_dx:.0f}cm | SX:{d_sx:.0f}cm"
+        # 9) Robot incastrato (FORWARD ma posa SLAM ferma)
+        if self.state == RobotState.PATROL_FORWARD and self.navigator.is_stuck(snap, now):
+            if self.navigator.escape_possible(snap):
+                self.escape_reason = "robot incastrato (posa SLAM ferma)"
+                self.set_state(RobotState.ESCAPE, self.escape_reason, now)
+                return "CMD:BACKWARD,30", f"[ESCAPE] {self.escape_reason}"
+            sector, ang = self.navigator.choose_heading(snap, now)
+            if sector is not None and sector != "Fronte":
+                self.avoidance_sector, self.avoidance_cmd = sector, turn_command_for_angle(ang)
+                self.set_state(RobotState.AVOIDANCE, "Incastrato → nuova direzione", now)
+                return self.avoidance_cmd, f"[DEVIAZIONE {sector}] robot incastrato"
 
-        # Livello 6: Puntamento saccadico LiDAR (solo se in pattugliamento libero e cooldown trascorso)
-        sector = str(lidar_alert.get("sector", "") if lidar_alert else "")
-        sector_en = str(lidar_alert.get("sector_en", "") if lidar_alert else "")
-        frontal_sector = sector in ("Fronte", "Front-DX", "Front-SX") or sector_en in (
-            "FRONT", "FRONT_RIGHT", "FRONT_LEFT"
-        )
+        # 10) Fronte HIGH (ostacolo 40–70 cm o rischio alto) → nuova deviazione
+        if risk_level == "HIGH" or front_cm < self.high_distance_cm or front_risk >= RISK_HIGH:
+            sector, ang = self.navigator.choose_heading(snap, now)
+            if sector is None:
+                if self.navigator.escape_possible(snap):
+                    self.escape_reason = "tutti i settori frontali bloccati"
+                    self.set_state(RobotState.ESCAPE, self.escape_reason, now)
+                    return "CMD:BACKWARD,30", f"[ESCAPE] {self.escape_reason}"
+                self.set_state(RobotState.EMERGENCY_STOP, "Bloccato su tutti i lati", now)
+                return "CMD:STOP", "[STOP] bloccato su tutti i lati"
+            if sector == "Fronte":
+                # il fronte resta il migliore (ostacolo laterale/diagonale): avanza piano
+                self.set_state(RobotState.PATROL_FORWARD, "Fronte migliore, rallento", now)
+                return f"CMD:FORWARD,{self.slow_speed}", f"[RALLENTA] fronte={front_cm:.0f}cm R={front_risk:.2f}"
+            self.avoidance_sector, self.avoidance_cmd = sector, turn_command_for_angle(ang)
+            self.set_state(RobotState.AVOIDANCE, f"Fronte {front_cm:.0f}cm R={front_risk:.2f} → {sector}", now)
+            scores = self.navigator.last_scores
+            return self.avoidance_cmd, f"[DEVIAZIONE {sector}] score={scores.get(sector, 0):.2f} fronte={front_cm:.0f}cm"
+
+        # 11) Saccade verso anomalia LiDAR laterale (percezione attiva), solo in pattugliamento libero
+        la = snap.lidar_alert or {}
+        sector_alert = str(la.get("sector") or la.get("sector_en") or "")
         if (
             self.state == RobotState.PATROL_FORWARD
-            and lidar_alert
-            and lidar_alert.get("has_alert", False)
-            and frontal_sector
-            and abs(float(lidar_alert.get("theta", 0) or 0)) > 20
-            and (now - self.last_saccade_end_time > self.saccade_cooldown_s)
+            and la.get("has_alert")
+            and sector_alert in ("Front-DX", "Front-SX", "FRONT_RIGHT", "FRONT_LEFT")
+            and (now - self.last_saccade_end_time) > self.saccade_cooldown_s
+            and not snap.objects  # se YOLO vede già l'oggetto non serve ruotare
         ):
-            self.target_theta = float(lidar_alert.get("theta", 0.0) or 0.0)
-            self.set_state(RobotState.INSPECTING_OBJECT, f"LiDAR rileva ostacolo a θ={self.target_theta:.0f}°")
-            turn_cmd = (
-                f"CMD:TURN_R,{abs(int(self.target_theta))}"
-                if self.target_theta > 0
-                else f"CMD:TURN_L,{abs(int(self.target_theta))}"
-            )
-            return turn_cmd, f"Puntamento saccadico verso θ={self.target_theta:.0f}°"
-
+            try:
+                theta = float(la.get("theta", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                theta = 0.0
+            if abs(theta) > 20.0:
+                self.target_theta = theta
+                self.set_state(RobotState.INSPECTING_OBJECT, f"Saccade verso θ={theta:.0f}°", now)
+                return turn_command_for_angle(theta), f"[SACCADE] ispezione θ={theta:.0f}°"
         if self.state == RobotState.INSPECTING_OBJECT:
             if now - self.state_enter_time > 1.2:
                 self.last_saccade_end_time = now
-                self.set_state(RobotState.PATROL_FORWARD, "Ispezione saccadica conclusa")
+                self.set_state(RobotState.PATROL_FORWARD, "Ispezione conclusa", now)
             else:
-                return "CMD:STOP", "Ispezione visiva 3D mirata"
+                return "CMD:STOP", "[SACCADE] acquisizione stereo/YOLO"
 
-        # Livello 7: Marcia regolare avanti / Controllo Pitch salita o discesa
-        if self.state != RobotState.PATROL_FORWARD:
-            self.set_state(RobotState.PATROL_FORWARD, "Marcia regolare libera")
-
-        if pitch_robot > 15.0:
-            return f"CMD:FORWARD,{self.forward_speed}", f"[PITCH ELEVATO: SALITA] Pitch: {pitch_robot:.1f}°"
-        elif pitch_robot < -15.0:
-            return "CMD:BACKWARD,30", f"[PITCH NEGATIVO: DISCESA] Pitch: {pitch_robot:.1f}°"
-        else:
-            return f"CMD:FORWARD,{self.forward_speed}", f"[MARCIA REGOLARE] Fronte: {dist_critica_fronte:.0f}cm"
+        # 12) Marcia regolare con velocità adattiva (la distanza fusa modula la velocità anche se
+        #     arriva dalla sola stereo: cautela sì, stop no)
+        self.set_state(RobotState.PATROL_FORWARD, "Marcia autonoma", now)
+        speed = self.navigator.cruise_speed(min(front_cm, snap.front_dist_cm), front_risk,
+                                            base=self.forward_speed, slow=self.slow_speed)
+        if snap.degraded:
+            # solo stereo in linea: niente LiDAR/US a confermare → velocità ridotta
+            speed = min(speed, self.slow_speed)
+        if pitch > 15.0 and not snap.degraded:
+            return f"CMD:FORWARD,{self.forward_speed}", f"[SALITA] pitch={pitch:.1f}° fronte={front_cm:.0f}cm"
+        if pitch < -15.0:
+            return f"CMD:FORWARD,{self.slow_speed}", f"[DISCESA] pitch={pitch:.1f}° fronte={front_cm:.0f}cm"
+        tag = "MARCIA" if risk_level == "LOW" else "CAUTELA"
+        return f"CMD:FORWARD,{speed}", f"[{tag}] fronte={front_cm:.0f}cm R={front_risk:.2f} v={speed}"

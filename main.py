@@ -1,77 +1,63 @@
 #!/usr/bin/env python3
 """
-M.A.R. — mar-decision-engine Microservice Daemon
-Consolidates multi-sensor perception (LiDAR 360° + Stereo 3D Vision),
-runs the Finite State Machine (FSM), and emits prioritized motion commands.
+M.A.R. — mar-decision-engine
+Fusione multi-sensore (LiDAR 360° + ultrasuoni + stereo 3D + YOLO + IMU + SLAM),
+equazione di rischio per settore, FSM di sicurezza e navigazione autonoma.
+
+Topic MQTT in ingresso:  mar/lidar/*, mar/ultrasonic/range, mar/hardware/telemetry,
+                         mar/vision/*, mar/imu/raw|telemetry, mar/slam/pose, mar/safety/*
+Topic MQTT in uscita:    mar/control/motion   (comandi per mar-serial-bridge)
+                         mar/fsm/state        (stato + mappa di rischio per la dashboard, 10 Hz)
+                         mar/imu/telemetry    (assetto Kalman)
+                         mar/decision/health  (watchdog sensori, 1 Hz)
 """
 
-import os
-import sys
-import time
 import json
+import os
 import signal
+import sys
+import threading
+import time
+from typing import Optional
 
 from fsm import DecisionFSM, RobotState
-from attention_controller import AttentionController
 from imu_fusion import IMUFusion
+from world_model import WorldModel
 
 try:
     import paho.mqtt.client as mqtt
-except ImportError:
+except ImportError:  # pragma: no cover
     mqtt = None
 
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 IMU_CALIBRATION_SAMPLES = int(os.getenv("IMU_CALIBRATION_SAMPLES", "100"))
 IMU_CALIBRATION_TIMEOUT_S = float(os.getenv("IMU_CALIBRATION_TIMEOUT_S", "12"))
+FORWARD_SPEED = int(os.getenv("MAR_FORWARD_SPEED", "50"))
+SLOW_SPEED = int(os.getenv("MAR_SLOW_SPEED", "25"))
+AUTONOMOUS_AT_BOOT = os.getenv("MAR_AUTONOMOUS", "1").strip().lower() in ("1", "true", "yes", "on")
+LOOP_HZ = float(os.getenv("MAR_DECISION_HZ", "20"))
+STATE_PUBLISH_HZ = float(os.getenv("MAR_STATE_HZ", "10"))
+CMD_REFRESH_S = float(os.getenv("MAR_CMD_REFRESH_S", "0.5"))   # ri-invio periodico del comando attivo
+MANUAL_TIMEOUT_S = float(os.getenv("MAR_MANUAL_TIMEOUT_S", "3.0"))  # dopo un comando manuale l'autonomia tace
 
-fsm = DecisionFSM(
-    forward_speed=50,
-    critical_distance_cm=40.0,
-    high_distance_cm=70.0,
-    moderate_distance_cm=120.0,
-    slow_warning_cm=70.0,
-)
-attention = AttentionController(settle_time_sec=0.4)
-imu_fusion = IMUFusion(
-    calibration_samples=IMU_CALIBRATION_SAMPLES,
-    calibration_timeout_s=IMU_CALIBRATION_TIMEOUT_S
-)
+world = WorldModel()
+fsm = DecisionFSM(forward_speed=FORWARD_SPEED, slow_speed=SLOW_SPEED, autonomous=AUTONOMOUS_AT_BOOT)
+imu_fusion = IMUFusion(calibration_samples=IMU_CALIBRATION_SAMPLES, calibration_timeout_s=IMU_CALIBRATION_TIMEOUT_S)
 
-latest_lidar_alert = None
-latest_vision_objects = None
-latest_ground_hazard = None
-latest_imu_data = None
-latest_motion_data = None
-latest_slam_pose = None
-latest_ultrasonic_cm = -1.0
-latest_ultrasonic_ts = 0.0
 decision_trigger = threading.Event()
+state_lock = threading.Lock()
 running = True
 mqtt_client = None
-
-
-def _ingest_ultrasonic(data: dict):
-    global latest_ultrasonic_cm, latest_ultrasonic_ts
-    for key in ("us_cm", "ultrasonic_cm", "ultrasonic", "us"):
-        if key in data and data[key] is not None:
-            try:
-                val = float(data[key])
-                if 2.0 <= val <= 400.0:
-                    latest_ultrasonic_cm = val
-                    latest_ultrasonic_ts = time.time()
-                    decision_trigger.set()
-                    return
-            except Exception:
-                pass
+last_manual_cmd_ts = 0.0
 
 
 def on_mqtt_connect(client, userdata, flags, rc, properties=None):
-    if rc == 0:
-        print(f"  ✓ MQTT on_connect: Sottoscrizione ai topic di sistema (rc={rc})")
+    ok = (rc == 0) or (str(rc) == "Success")
+    if ok:
+        print(f"  ✓ MQTT connesso ({MQTT_BROKER}:{MQTT_PORT}) — sottoscrizione topic di sistema")
         client.subscribe([
             ("mar/slam/pose", 0),
-            ("mar/slam/map", 0),
             ("mar/lidar/alert", 0),
             ("mar/lidar/telemetry", 0),
             ("mar/lidar/scan", 0),
@@ -83,195 +69,217 @@ def on_mqtt_connect(client, userdata, flags, rc, properties=None):
             ("mar/imu/telemetry", 0),
             ("mar/hardware/telemetry", 0),
             ("mar/ultrasonic/range", 0),
+            ("mar/control/motion", 0),
+            ("mar/control/mode", 1),
             ("mar/safety/estop", 2),
             ("mar/safety/resume", 1),
         ])
     else:
-        print(f"  ✗ MQTT on_connect fallito con codice rc={rc}")
+        print(f"  ✗ MQTT on_connect fallito rc={rc}")
 
 
 def on_mqtt_message(client, userdata, msg):
-    global latest_lidar_alert, latest_vision_objects, latest_ground_hazard, latest_imu_data, latest_ultrasonic_cm, latest_motion_data, latest_slam_pose
+    global last_manual_cmd_ts
     topic = msg.topic
     try:
         data = json.loads(msg.payload.decode("utf-8"))
     except Exception:
         return
+    if not isinstance(data, dict):
+        return
 
-    if topic == "mar/slam/pose":
-        latest_slam_pose = data
-    elif topic in ("mar/lidar/alert", "mar/lidar/telemetry"):
-        latest_lidar_alert = data
-        decision_trigger.set()
-    elif topic == "mar/lidar/scan":
-        if latest_lidar_alert is None:
-            latest_lidar_alert = data
-        else:
-            if "sector_mins" in data:
-                latest_lidar_alert["sector_mins"] = data["sector_mins"]
-            if "front_distance_m" in data:
-                latest_lidar_alert["front_distance_m"] = data["front_distance_m"]
-            if "point_count" in data:
-                latest_lidar_alert["point_count"] = data["point_count"]
-            latest_lidar_alert["timestamp"] = data.get("timestamp", time.time())
-        decision_trigger.set()
-    elif topic == "mar/vision/motion":
-        latest_motion_data = data
-        decision_trigger.set()
-    elif topic == "mar/vision/detections":
-        latest_vision_objects = data
-        if "motion" in data:
-            latest_motion_data = data["motion"]
-        decision_trigger.set()
-    elif topic == "mar/vision/command":
-        # Merge command risk/distance into detections for FSM fusion
-        if latest_vision_objects is None:
-            latest_vision_objects = {}
-        latest_vision_objects = {
-            **latest_vision_objects,
-            "target_dist_cm": data.get("target_dist_cm", latest_vision_objects.get("target_dist_cm")),
-            "obstacle_near_cm": data.get("obstacle_near_cm", latest_vision_objects.get("obstacle_near_cm")),
-            "risk_level": data.get("risk_level", latest_vision_objects.get("risk_level")),
-            "timestamp": data.get("timestamp", time.time()),
-        }
-        decision_trigger.set()
-    elif topic == "mar/vision/ground_hazard":
-        latest_ground_hazard = data
-        decision_trigger.set()
-    elif topic == "mar/imu/raw":
-        # Raw IMU samples from mar-serial-bridge -> Kalman quaternion fusion
+    now = time.time()
+    if topic == "mar/imu/raw":
         imu_fusion.feed(data)
-    elif topic == "mar/imu/telemetry":
-        latest_imu_data = data
-    elif topic == "mar/ultrasonic/range":
-        _ingest_ultrasonic(data)
-    elif topic == "mar/hardware/telemetry":
-        _ingest_ultrasonic(data)
-        # Extract IMU roll/pitch from Arduino telemetry if available
-        if "roll" in data and "pitch" in data:
-            try:
-                latest_imu_data = {
-                    "roll": float(data["roll"]),
-                    "pitch": float(data["pitch"]),
-                    "timestamp": time.time()
-                }
-            except Exception:
-                pass
-    elif topic == "mar/safety/estop":
-        print(f"🚨 [FSM E-STOP TRIGGERED]: {data}")
-        fsm.trigger_operator_estop("E-Stop da operatore o sensore critico")
+        return
+    if topic == "mar/safety/estop":
+        print(f"🚨 [E-STOP] {data}")
+        with state_lock:
+            fsm.trigger_operator_estop(f"E-Stop da {data.get('source', 'operatore')}")
         decision_trigger.set()
-    elif topic == "mar/safety/resume":
-        print(f"✅ [FSM RESUME]: {data}")
-        fsm.clear_operator_estop("Resume da operatore")
+        return
+    if topic == "mar/safety/resume":
+        print(f"✅ [RESUME] {data}")
+        with state_lock:
+            fsm.clear_operator_estop(f"Resume da {data.get('source', 'operatore')}")
+        decision_trigger.set()
+        return
+    if topic == "mar/control/mode":
+        mode = str(data.get("mode", "")).upper()
+        with state_lock:
+            if mode in ("AUTO", "AUTONOMOUS"):
+                fsm.set_autonomous(True, "Modalità AUTONOMA da operatore")
+            elif mode in ("MANUAL", "IDLE", "TELEOP"):
+                fsm.set_autonomous(False, f"Modalità {mode} da operatore")
+        decision_trigger.set()
+        return
+    if topic == "mar/control/motion":
+        # comandi manuali (dashboard / LoRa) → l'autonomia si sospende per MANUAL_TIMEOUT_S
+        src = str(data.get("source", "")).upper()
+        state = str(data.get("state", "")).upper()
+        if src in ("WEBSOCKET", "LORA_RADIO") or state == "MANUAL":
+            last_manual_cmd_ts = now
+        return
+
+    with state_lock:
+        relevant = world.ingest(topic, data, now)
+    if relevant:
         decision_trigger.set()
 
 
 def signal_handler(sig, frame):
     global running
-    print("\n[DECISION-ENGINE] Arresto del motore decisionale...")
+    print("\n[DECISION-ENGINE] Arresto...")
     running = False
-    sys.exit(0)
+
+
+def _publish(topic: str, payload: dict, qos: int = 0):
+    if mqtt_client is not None and mqtt_client.is_connected():
+        try:
+            mqtt_client.publish(topic, json.dumps(payload, separators=(",", ":")), qos=qos)
+        except Exception as e:  # pragma: no cover
+            print(f"[MQTT] publish {topic} fallita: {e}")
+
+
+def _cmd_to_dict(cmd: str, reason: str) -> dict:
+    payload_cmd = cmd.replace("CMD:", "", 1)
+    parts = payload_cmd.split(",", 1)
+    return {
+        "cmd": parts[0],
+        "param": parts[1] if len(parts) > 1 else "",
+        "reason": reason,
+        "state": fsm.state.name,
+        "source": "DECISION_ENGINE",
+        "timestamp": time.time(),
+    }
 
 
 def main():
-    global running, mqtt_client, latest_imu_data
+    global running, mqtt_client
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    print("=" * 60)
-    print(" 🐾 M.A.R. — CORE DECISION ENGINE & SAFETY FSM")
-    print("=" * 60)
+    print("=" * 64)
+    print(" 🐾 M.A.R. — DECISION ENGINE · SENSOR FUSION · SAFETY FSM")
+    print("=" * 64)
+    print(f"  • loop {LOOP_HZ:.0f} Hz | stato → dashboard {STATE_PUBLISH_HZ:.0f} Hz | autonomia={'ON' if AUTONOMOUS_AT_BOOT else 'OFF'}")
+    print("  • equazione rischio: R_s = 1-(1-P_s)(1-Q_s) | pesi distanza US=1.0 LiDAR=1.0 stereo=0.6")
 
-    # Inizializza stato: avvia in PATROL_FORWARD dopo 1 secondo di setup
-    fsm.set_state(RobotState.PATROL_FORWARD, "Avvio del sistema autonomo")
-
-    if mqtt:
-        mqtt_client = mqtt.Client(client_id="mar-decision-engine")
+    if mqtt is not None:
+        try:
+            mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="mar-decision-engine")
+        except Exception:
+            mqtt_client = mqtt.Client(client_id="mar-decision-engine")
         mqtt_client.on_connect = on_mqtt_connect
         mqtt_client.on_message = on_mqtt_message
-        connected = False
-        for attempt in range(1, 16):
+        for attempt in range(1, 31):
             try:
                 mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
                 mqtt_client.loop_start()
-                print(f"  ✓ Avviato loop MQTT verso ({MQTT_BROKER}:{MQTT_PORT})")
-                connected = True
                 break
             except Exception as e:
-                print(f"  ⚠️ MQTT tentativo {attempt}/15 fallito ({e}). Retry in 2s...")
+                print(f"  ⚠️ MQTT tentativo {attempt}/30 fallito ({e}); retry 2s")
                 time.sleep(2)
-        if not connected:
-            print("  ⚠️ MQTT non raggiungibile. Esecuzione standalone.")
+        else:
+            print("  ⚠️ MQTT non raggiungibile: esecuzione standalone (nessun comando ai motori).")
+    else:
+        print("  ⚠️ paho-mqtt non installato: esecuzione standalone.")
 
-    print("\n[DECISION-ENGINE] Ciclo decisionale attivo a 20 Hz...\n")
+    if AUTONOMOUS_AT_BOOT:
+        fsm.set_state(RobotState.PATROL_FORWARD, "Avvio sistema autonomo")
 
+    loop_dt = 1.0 / max(1.0, LOOP_HZ)
+    state_dt = 1.0 / max(1.0, STATE_PUBLISH_HZ)
     last_cmd = ""
+    last_cmd_ts = 0.0
+    last_state_pub = 0.0
+    last_health_pub = 0.0
+    last_log_state: Optional[str] = None
 
+    print("\n[DECISION-ENGINE] ciclo decisionale attivo\n")
     while running:
-        # Attitude from the quaternion Kalman filter (fresh samples from mar-serial-bridge)
+        now = time.time()
+
         fused_imu = imu_fusion.latest(max_age_s=1.0)
-        if fused_imu is not None:
-            latest_imu_data = fused_imu
+        with state_lock:
+            if fused_imu is not None:
+                world.set_imu(fused_imu, now)
+            snap = world.snapshot(now)
+            cmd, reason = fsm.update(snap)
+            decision = dict(fsm.last_decision)
 
-        # Ultrasuoni solo se freschi (< 1.5s)
-        us_cm = latest_ultrasonic_cm
-        if us_cm > 0 and (time.time() - latest_ultrasonic_ts) > 1.5:
-            us_cm = -1.0
-
-        # Esegui tick FSM
-        cmd, reason = fsm.update(
-            lidar_alert=latest_lidar_alert,
-            vision_objects=latest_vision_objects,
-            ultrasonic_distance_cm=us_cm,
-            ground_hazard_alert=latest_ground_hazard,
-            imu_data=latest_imu_data,
-            motion_data=latest_motion_data
-        )
-
-        # Se il comando cambia o a intervalli periodici, invia a mar-serial-bridge
-        if cmd != last_cmd:
+        manual_recent = (now - last_manual_cmd_ts) < MANUAL_TIMEOUT_S
+        safety_cmd = cmd.startswith("CMD:STOP")
+        # In teleoperazione recente l'autonomia non muove il robot, ma gli STOP di sicurezza passano sempre
+        if cmd != last_cmd or (now - last_cmd_ts) >= CMD_REFRESH_S:
+            if cmd != last_cmd:
+                print(f"🤖 [DECISION] {cmd} | {reason}")
+            if not manual_recent or safety_cmd:
+                _publish("mar/control/motion", _cmd_to_dict(cmd, reason))
             last_cmd = cmd
-            print(f"🤖 [DECISION]: {cmd} | {reason}")
-            if mqtt_client and mqtt_client.is_connected():
-                payload_cmd = cmd.replace("CMD:", "")
-                parts = payload_cmd.split(",", 1)
-                cmd_dict = {
-                    "cmd": parts[0],
-                    "param": parts[1] if len(parts) > 1 else "",
-                    "reason": reason,
-                    "state": fsm.state.name,
-                    "timestamp": time.time()
-                }
-                mqtt_client.publish("mar/control/motion", json.dumps(cmd_dict))
+            last_cmd_ts = now
 
-        # Pubblica stato FSM unificato per la Dashboard (tutti i sensori passati assieme)
-        if mqtt_client and mqtt_client.is_connected():
-            fusion_meta = getattr(fsm, "last_fusion_meta", {})
-            lidar_front_m = latest_lidar_alert.get("front_distance_m") if latest_lidar_alert else None
-            point_cnt = latest_lidar_alert.get("point_count") if latest_lidar_alert else 0
-
+        if now - last_state_pub >= state_dt:
+            last_state_pub = now
+            world_payload = snap.to_payload()
             state_payload = {
                 "state": fsm.state.name,
+                "autonomous": fsm.autonomous,
+                "manual_override": manual_recent,
                 "active_command": cmd,
                 "reason": reason,
-                "risk_level": getattr(fsm, "latest_risk_level", getattr(fsm.front_risk, "held_level", "LOW")),
-                "timestamp": time.time(),
-                "fusion": fusion_meta,
-                "ultrasonic_cm": round(float(us_cm), 1) if us_cm > 0 else None,
-                "lidar_front_m": lidar_front_m,
-                "point_count": point_cnt,
-                "slam_pose": latest_slam_pose,
+                "risk_level": fsm.latest_risk_level,
+                "risk_value": round(fsm.latest_risk_value, 3),
+                "timestamp": now,
+                # compatibilità dashboard (campi piatti)
+                "ultrasonic_cm": round(snap.us_cm, 1) if snap.us_cm else None,
+                "lidar_front_m": round(snap.lidar_front_cm / 100.0, 3) if snap.lidar_front_cm else None,
+                "stereo_front_cm": round(snap.stereo_front_cm, 1) if snap.stereo_front_cm else None,
+                "front_dist_cm": round(snap.front_dist_cm, 1) if snap.front_dist_cm < 900 else None,
+                "point_count": snap.point_count,
+                "slam_pose": snap.pose,
+                "imu": {"roll": snap.imu.get("roll"), "pitch": snap.imu.get("pitch"), "yaw": snap.imu.get("yaw")} if snap.imu else None,
+                # nuova fusione
+                "fusion": world_payload,
+                "navigation": {
+                    "choice": decision.get("nav_choice"),
+                    "scores": decision.get("nav_scores", {}),
+                    "front_cm": decision.get("front_cm"),
+                    "front_risk": decision.get("front_risk"),
+                },
             }
-            mqtt_client.publish("mar/fsm/state", json.dumps(state_payload))
-
-            # Assetto filtrato (Kalman) per dashboard, LoRa e telemetria
+            _publish("mar/fsm/state", state_payload)
             if fused_imu is not None:
-                mqtt_client.publish("mar/imu/telemetry", json.dumps(fused_imu))
+                _publish("mar/imu/telemetry", fused_imu)
 
-        # Attesa reattiva: si sveglia istantaneamente se arriva un nuovo pacchetto sensore (< 1ms)
-        decision_trigger.wait(timeout=0.04)
+        if now - last_health_pub >= 1.0:
+            last_health_pub = now
+            _publish("mar/decision/health", {
+                "timestamp": now,
+                "sensors": snap.sensors_online,
+                "state": fsm.state.name,
+                "autonomous": fsm.autonomous,
+                "imu_calibrated": bool(getattr(imu_fusion, "calibrated", False)),
+                "us_simulated_seen": world.us_simulated,
+            })
+            if last_log_state != fsm.state.name:
+                last_log_state = fsm.state.name
+            missing = [k for k, v in snap.sensors_online.items() if not v]
+            if missing and int(now) % 10 == 0:
+                print(f"  ℹ️ sensori non freschi: {', '.join(missing)}")
+
+        decision_trigger.wait(timeout=loop_dt)
         decision_trigger.clear()
+
+    # uscita pulita: ferma i motori
+    _publish("mar/control/motion", _cmd_to_dict("CMD:STOP", "shutdown decision engine"))
+    if mqtt_client is not None:
+        try:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
+        except Exception:
+            pass
+    sys.exit(0)
 
 
 if __name__ == "__main__":
