@@ -10,8 +10,8 @@ Tutto il sistema decisionale ruota attorno a UNA equazione per settore s
     P_s = prossimità = 1 - Π_i ( 1 - w_i · p(d_i) )       per ogni sensore i che vede il settore
     Q_s = oggetti    = max_o  w_class(o) · conf(o) · p(d_o)   per gli oggetti YOLO nel settore
 
-    p(d) = 1 (d ≤ 30cm) → 0.85 (40cm) → 0.60 (70cm) → 0.30 (120cm) → 0 (≥150cm), lineare a tratti,
-           così che il livello di p(d) coincide con le bande di safety_bands.
+    p(d) = 1 (d ≤ 30cm) → 0.85 (40cm) → 0.60 (70cm) → 0.30 (80cm) → 0 (≥120cm), lineare a tratti.
+           Sotto 80 cm c'è cautela vera; un muro o un sensore a ~1 m non tengono il robot in MODERATE.
 
 Pesi w_i = quanto ci fidiamo della DISTANZA riportata dal sensore i:
 
@@ -60,7 +60,7 @@ FRONT_SECTORS: Tuple[str, ...] = ("Front-SX", "Fronte", "Front-DX")
 
 # Banda della funzione di prossimità p(d)
 D_NEAR_CM = 30.0
-D_FAR_CM = 150.0
+D_FAR_CM = 120.0
 
 # Soglie rischio → livello
 RISK_CRITICAL = 0.85
@@ -90,7 +90,7 @@ DYNAMIC_CLASSES = {"person", "dog", "cat", "bird", "horse", "sheep", "cow", "bic
 
 
 # p(d) lineare a tratti, ancorata alle bande di safety_bands così che
-# livello(p(d)) == classify_distance_cm(d):  40cm→0.85  70cm→0.60  120cm→0.30
+# livello(p(d)) == classify_distance_cm(d):  40cm→0.85  70cm→0.60  80cm→0.30  ≥120cm→0
 _P_KNOTS: Tuple[Tuple[float, float], ...] = (
     (D_NEAR_CM, 1.0),
     (DIST_CRITICAL_CM, RISK_CRITICAL),

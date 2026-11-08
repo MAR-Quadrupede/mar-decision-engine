@@ -8,8 +8,8 @@ Test matrix (hold a sheet / hand / box in FRONT of the stereo camera):
 |------------|------------------|------------------|------------------|
 | CRITICAL   |  < 40 cm         | STOP             | CRITICAL         |
 | HIGH       |  40 – 70 cm      | FRENA            | HIGH             |
-| MODERATE   |  70 – 120 cm     | AVANTI (lento)   | MODERATE         |
-| LOW        |  > 120 cm        | AVANTI           | LOW              |
+| MODERATE   |  70 – 80 cm      | AVANTI (lento)   | MODERATE         |
+| LOW        |  > 80 cm         | AVANTI           | LOW              |
 
 LiDAR/FSM use the same centimetre cuts so dashboard, vision and motors agree.
 
@@ -30,7 +30,7 @@ from typing import Optional, Tuple
 # Centimetri — taratura fisica robot (ispirata al codice definitivo canelidarstereoimudef2)
 DIST_CRITICAL_CM = 40.0   # < 40 cm: arresto immediato di collisione
 DIST_HIGH_CM = 70.0       # 40-70 cm: deviazione / schivamento dinamico
-DIST_MODERATE_CM = 120.0  # 70-120 cm: allerta di prossimità
+DIST_MODERATE_CM = 80.0   # 70-80 cm: cautela. Oltre, una stanza normale è LOW
 
 # Metri (dashboard / MQTT consumers)
 DIST_CRITICAL_M = DIST_CRITICAL_CM / 100.0
@@ -44,7 +44,7 @@ _RISK_IDX = {name: i for i, name in enumerate(RISK_LEVELS)}
 # Isteresi in uscita: bisogna essere più lontani per scendere di livello
 EXIT_CRITICAL_CM = DIST_CRITICAL_CM + 12.0   # 52 — leave CRITICAL
 EXIT_HIGH_CM = DIST_HIGH_CM + 15.0           # 85 — leave HIGH
-EXIT_MODERATE_CM = DIST_MODERATE_CM + 20.0   # 140 — leave MODERATE
+EXIT_MODERATE_CM = DIST_MODERATE_CM + 15.0   # 95 — leave MODERATE
 
 
 def classify_distance_cm(dist_cm: float) -> str:
