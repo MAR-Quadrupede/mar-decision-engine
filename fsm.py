@@ -236,7 +236,14 @@ class DecisionFSM:
                     self.escape_reason = "fronte bloccato dopo stop"
                     self.set_state(RobotState.ESCAPE, self.escape_reason, now)
                     return "CMD:BACKWARD,30", f"[ESCAPE] {self.escape_reason}"
-                return "CMD:STOP", f"[ATTESA VIA LIBERA] fronte={front_cm:.0f}cm (< {self.EXIT_CRITICAL_CM:.0f})"
+                if front_cm < self.EXIT_CRITICAL_CM:
+                    why = f"fronte={front_cm:.0f}cm (< {self.EXIT_CRITICAL_CM:.0f})"
+                elif snap.ground_hazard:
+                    why = "ostacolo a terra"
+                else:
+                    objs = [o.get("class") for o in (snap.objects or [])][:2]
+                    why = f"R={front_risk:.2f} ≥ {RISK_HIGH:.2f}" + (f" ({', '.join(str(o) for o in objs)})" if objs else "")
+                return "CMD:STOP", f"[ATTESA VIA LIBERA] {why}"
 
         # 6) Dislivello / ostacolo a terra
         if snap.ground_hazard and snap.z_basso_cm < self.ground_hazard_cm:
