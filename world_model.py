@@ -84,6 +84,7 @@ class Snapshot:
     sensors_online: Dict[str, bool] = field(default_factory=dict)
     # None = il bridge non ha ancora detto nulla; False = Arduino motion assente
     motion_connected: Optional[bool] = None
+    us_echo: bool = True
 
     @property
     def front_reliable_cm(self) -> Optional[float]:
@@ -132,7 +133,8 @@ class Snapshot:
             "degraded": self.degraded,
             "gate_distance_cm": round(self.gate_distance_cm(), 1) if self.gate_distance_cm() < 900 else None,
             "inputs": {
-                "ultrasonic_cm": round(self.us_cm, 1) if self.us_cm else None,
+                "ultrasonic_cm": round(self.us_cm, 1) if self.us_fresh and self.us_cm else None,
+                "ultrasonic_echo": self.us_echo,
                 "lidar_front_cm": round(self.lidar_front_cm, 1) if self.lidar_front_cm else None,
                 "stereo_front_cm": round(self.stereo_front_cm, 1) if self.stereo_front_cm else None,
             },
@@ -151,6 +153,9 @@ class WorldModel:
         self.us_cm: float = -1.0
         self.us_ts: float = 0.0
         self.us_simulated: bool = False
+        # L'ultimo pacchetto US:400 è il timeout dello sketch (nessun eco), non una distanza.
+        self.us_echo: bool = True
+        self.us_echo_ts: float = 0.0
         self.vision: Optional[Dict[str, Any]] = None
         self.vision_ts: float = 0.0
         self.vision_cmd: Optional[Dict[str, Any]] = None
@@ -234,12 +239,19 @@ class WorldModel:
                     cm = float(v)
                 except (TypeError, ValueError):
                     continue
-                if 2.0 <= cm <= 400.0:
+                if cm >= 390.0:
+                    # Sketch ultrasonic_makeblock_a2: pulseIn andato in timeout → stampa 400.
+                    # Non è "spazio libero a 4 m".
+                    self.us_echo = False
+                    self.us_echo_ts = now
+                    return False
+                if 2.0 <= cm < 390.0:
                     if simulated:
                         # letture simulate: NON entrano nella fusione di sicurezza
                         self.us_simulated = True
                         return False
                     self.us_simulated = False
+                    self.us_echo = True
                     self.us_cm = cm
                     self.us_ts = now
                     return True
@@ -309,7 +321,8 @@ class WorldModel:
         now = time.time() if now is None else now
 
         lidar_fresh = self.lidar is not None and (now - self.lidar_ts) <= FRESH_LIDAR_S
-        us_fresh = self.us_cm > 0 and (now - self.us_ts) <= FRESH_US_S
+        no_echo = (not self.us_echo) and self.us_echo_ts >= self.us_ts and (now - self.us_echo_ts) <= FRESH_US_S
+        us_fresh = (not no_echo) and self.us_cm > 0 and (now - self.us_ts) <= FRESH_US_S
         stereo_fresh = self.vision is not None and (now - self.vision_ts) <= FRESH_VISION_S
         cmd_fresh = self.vision_cmd is not None and (now - self.vision_cmd_ts) <= FRESH_VISION_S
         objs_fresh = (now - self.objects_ts) <= FRESH_OBJECTS_S and bool(self.objects)
@@ -442,6 +455,7 @@ class WorldModel:
             us_fresh=us_fresh,
             stereo_fresh=stereo_fresh,
             us_cm=self.us_cm if us_fresh else None,
+            us_echo=not no_echo,
             lidar_front_cm=lidar_front_cm,
             stereo_front_cm=stereo_front_cm,
             ground_hazard=ground_hazard,
