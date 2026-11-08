@@ -345,17 +345,23 @@ def compute_sector_risk(
 
 def frontal_risk(sector_risks: Dict[str, SectorRisk]) -> Tuple[float, str]:
     """
-    Rischio frontale aggregato per la marcia avanti:
-    il settore Fronte pesa 1.0, i due settori diagonali 0.7 (il corpo del robot li lambisce).
+    Rischio della marcia avanti. Il numero grande segue il muso (Fronte).
+
+    Un angolo entra nel numero solo se è davvero vicino: sotto 40 cm pesa 0.7
+    (il corpo lo lambisce), tra 40 e 70 cm pesa 0.44. Oltre, è la stanza e non
+    tiene il robot in MODERATE.
     """
     f = sector_risks.get("Fronte")
-    fl = sector_risks.get("Front-SX")
-    fr = sector_risks.get("Front-DX")
-    r = max(
-        f.risk if f else 0.0,
-        0.7 * (fl.risk if fl else 0.0),
-        0.7 * (fr.risk if fr else 0.0),
-    )
+    r = f.risk if f else 0.0
+    for key in ("Front-SX", "Front-DX"):
+        s = sector_risks.get(key)
+        if s is None:
+            continue
+        d = s.min_reliable_cm
+        if d is not None and d < DIST_CRITICAL_CM:
+            r = max(r, 0.7 * s.risk)
+        elif d is not None and d < DIST_HIGH_CM:
+            r = max(r, 0.44 * s.risk)
     return float(r), risk_to_level(r)
 
 
